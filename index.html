@@ -20,10 +20,13 @@
       <p class="eyebrow">ForeverGarden</p>
       <h1>Your garden, <em>sketched.</em></h1>
       <p class="lede">Stand at the back door and take a photo looking down the garden. It becomes a garden designer's sketch you can walk through, watch change through the year, and plant into.</p>
-      <button class="btn dark onboard-btn" id="onboard-photo"><svg viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="14" rx="2"/><circle cx="12" cy="13" r="3.5"/><path d="m8 6 1.5-2h5L16 6"/></svg>Take or choose a photo</button>
+      <button class="btn dark onboard-btn" id="onboard-guided"><svg viewBox="0 0 24 24"><path d="M12 21s7-4.4 7-11a7 7 0 0 0-14 0c0 6.6 7 11 7 11Z"/><circle cx="12" cy="10" r="2.2"/></svg>Start a guided photo walk</button>
+      <p class="muted" style="margin:-4px 0 4px;text-align:center">Five photos, about five minutes. I'll tell you where to stand.</p>
+      <button class="btn" id="onboard-photo"><svg viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="14" rx="2"/><circle cx="12" cy="13" r="3.5"/><path d="m8 6 1.5-2h5L16 6"/></svg>Just one photo for now</button>
       <button class="btn ghost" id="onboard-restore">Restore a backup</button>
       <p class="muted onboard-note">Your photos and plans stay on this phone. Nothing is uploaded unless you use the optional Claude features.</p>
     </section>
+    <section class="onboarding-panel guide-panel" id="guide" hidden></section>
     <div class="app">
       <header class="topbar">
         <div class="brand"><img src="icons/icon-192.png" alt="" class="brand-icon" /><span id="garden-name">ForeverGarden</span></div>
@@ -63,6 +66,7 @@
         <section class="view" id="view-year" hidden aria-label="Through the year">
           <div class="page-head"><p class="eyebrow">Through the year</p><h1 id="year-title">From the patio</h1><p class="lede">Every month painted from the same spot, with what is actually in flower.</p></div>
           <div class="year-grid" id="year-grid"></div>
+          <section class="card" id="weather-card"></section>
           <section class="card">
             <div class="card-head"><h2>Flowering calendar</h2><span class="muted" id="calendar-scope"></span></div>
             <div class="calendar" id="calendar"></div>
@@ -94,6 +98,8 @@
           <div class="action-row">
             <button class="btn dark" id="identify-btn"><svg viewBox="0 0 24 24"><path d="M4 7V5a1 1 0 0 1 1-1h2m10 0h2a1 1 0 0 1 1 1v2m0 10v2a1 1 0 0 1-1 1h-2M7 20H5a1 1 0 0 1-1-1v-2"/><circle cx="12" cy="12" r="3.5"/></svg>Identify a plant</button>
             <button class="btn" id="new-view-btn"><svg viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="14" rx="2"/><circle cx="12" cy="13" r="3.5"/><path d="m8 6 1.5-2h5L16 6"/></svg>Add a view</button>
+            <button class="btn" id="guided-btn"><svg viewBox="0 0 24 24"><path d="M12 21s7-4.4 7-11a7 7 0 0 0-14 0c0 6.6 7 11 7 11Z"/><circle cx="12" cy="10" r="2.2"/></svg>Guided photo walk</button>
+            <button class="btn" id="excel-btn"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>Download Excel</button>
           </div>
           <section class="card"><div class="card-head"><h2>Views</h2><span class="muted">Places you stand and look from</span></div><div id="views-list"></div></section>
           <section class="card"><div class="card-head"><h2>In the garden</h2><span class="muted" id="existing-count"></span></div><div id="existing-list"></div></section>

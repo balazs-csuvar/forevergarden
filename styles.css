@@ -124,6 +124,38 @@ main { padding-bottom: calc(var(--tabs) + var(--safe-b) + 16px); }
 .overlay.no-labels .outlines polygon:not(.draft):not(.selected) { display: none; }
 .outline-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 6px 0 12px; }
 
+body.guiding .app, body.guiding .onboarding-panel:not(.guide-panel) { display: none; }
+.guide-panel { justify-content: flex-start; padding-top: 20px; gap: 10px; }
+.guide-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.guide-dots { display: flex; gap: 6px; }
+.guide-dots i { width: 9px; height: 9px; border-radius: 50%; background: var(--line); }
+.guide-dots i.done { background: var(--sage); }
+.guide-dots i.now { background: var(--terra); }
+.guide-diagram { width: 100%; height: 34dvh; flex: none; margin: 4px 0; stroke: none; fill: none; }
+.guide-busy { min-height: 70dvh; display: grid; place-content: center; justify-items: center; gap: 14px; }
+.diary-strip { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
+.diary-thumb { flex: none; width: 84px; border: 0; background: none; padding: 0; text-align: left; }
+.diary-thumb img { width: 84px; height: 84px; object-fit: cover; border-radius: 10px; display: block; background: var(--paper-2); }
+.diary-thumb small { display: block; font-size: 11px; color: var(--muted); margin-top: 3px; }
+.diary-add { flex: none; width: 84px; height: 84px; border: 1.5px dashed var(--line); border-radius: 10px; background: #fffdf8; color: var(--sage); font-weight: 600; font-size: 12px; }
+.viewer-img { width: 100%; border-radius: 12px; display: block; margin: 8px 0; }
+.wx-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 4px 0 12px; }
+.wx-stat { background: var(--paper-2); border-radius: 10px; padding: 8px; }
+.wx-stat b { display: block; font-size: 17px; font-weight: 700; }
+.wx-stat span { font-size: 11px; color: var(--muted); }
+.wx-chart { position: relative; margin-top: 6px; }
+.wx-chart h3 { margin: 10px 0 4px; font-size: 12px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .8px; }
+.wx-chart svg { width: 100%; height: auto; display: block; overflow: visible; stroke: none; fill: none; }
+.wx-chart text { font: 10px var(--sans); fill: var(--muted); }
+.wx-tip { position: absolute; pointer-events: none; background: var(--deep); color: #fff; font-size: 12px; padding: 6px 9px; border-radius: 8px; white-space: nowrap; transform: translate(-50%, -110%); z-index: 2; }
+.wx-table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 12px; }
+.wx-table th { text-align: right; color: var(--muted); font-weight: 700; font-size: 11px; padding: 4px; }
+.wx-table th:first-child, .wx-table td:first-child { text-align: left; }
+.wx-table td { text-align: right; padding: 5px 4px; border-top: 1px solid var(--line); }
+.wx-table td small { color: var(--muted); display: block; font-size: 10.5px; }
+.inline-row { display: flex; gap: 6px; }
+.inline-row input { flex: 1; }
+
 /* PAGES */
 .page-head { padding: 22px 16px 10px; }
 .eyebrow { margin: 0 0 4px; font-size: 11px; letter-spacing: 1.2px; text-transform: uppercase; color: var(--muted); font-weight: 700; }
@@ -170,7 +202,7 @@ h2 { font-family: var(--serif); font-weight: 400; font-size: 21px; margin: 0; }
 .chip small { font-weight: 500; opacity: 0.75; }
 .area-card p { margin: 6px 0 12px; font-size: 14px; line-height: 1.5; color: var(--muted); }
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-label.field { display: flex; flex-direction: column; gap: 5px; font-size: 12px; font-weight: 700; color: var(--muted); }
+.field { display: flex; flex-direction: column; gap: 5px; font-size: 12px; font-weight: 700; color: var(--muted); }
 select, input[type="text"], input[type="password"], input[type="search"], textarea { width: 100%; border: 1px solid var(--line); background: #fffdf8; border-radius: 10px; padding: 10px 12px; font-size: 15px; color: var(--ink); }
 textarea { resize: vertical; margin: 10px 0; }
 .gapbar { display: grid; grid-template-columns: repeat(12, 1fr); gap: 3px; margin-top: 14px; }

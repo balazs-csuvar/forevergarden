@@ -5,6 +5,8 @@ import { buildFirstGarden, newSpot } from "./seed.js";
 import { paintPlant, paintExistingSeason, plantState } from "./painter.js";
 import { MONTHS, MON, monthRange, nearestArea, bloomCoverage, speciesFor, recommendFor, describeConditions, fitsConditions } from "./recommend.js";
 import * as ai from "./ai.js";
+import { loadWeather, syncWeather, findPlace, monthSummary, lastDays, isoDay } from "./weather.js";
+import { GUIDE_STEPS, GUIDE_LINKS, GUIDE_AREAS, guideDiagram } from "./guided.js";
 
 const ENGINE = "sk4";
 const WORK_SIZE = 960;
@@ -20,6 +22,7 @@ const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let state;
 let apiKey = "";
+let weatherLog = { days: {} };
 const ui = { view: "walk", spotId: null, month: new Date().getMonth(), labels: true, edit: false, photo: false, mode: null, history: [], areaId: null, gapMonth: null, playing: false, sheetPlacement: null };
 
 /* ---------- persistence ---------- */
@@ -337,7 +340,9 @@ function renderWalkHeader() {
   const here = state.placements.filter((p) => p.spotId === spot.id);
   const blooming = here.filter((p) => speciesFor(state, p.speciesId)?.bloom?.includes(ui.month)).length;
   const planned = here.filter((p) => p.status === "planned").length;
-  $("#spot-sub").textContent = `${MONTHS[ui.month]} · ${blooming ? `${blooming} in flower` : "nothing in flower"}${planned ? ` · ${planned} planned` : ""}`;
+  const yday = weatherLog.days[isoDay(new Date(Date.now() - 864e5))];
+  const wx = yday && ui.month === new Date().getMonth() ? ` · yesterday ${Math.round(yday.tmin)}–${Math.round(yday.tmax)}°C, ${yday.rain} mm` : "";
+  $("#spot-sub").textContent = `${MONTHS[ui.month]} · ${blooming ? `${blooming} in flower` : "nothing in flower"}${planned ? ` · ${planned} planned` : ""}${wx}`;
   $("#back-btn").hidden = !ui.history.length;
   $("#edit-toggle").setAttribute("aria-pressed", String(ui.edit));
   $("#stage").classList.toggle("edit", ui.edit);
@@ -765,6 +770,7 @@ function openPlacementSheet(id, { scrollToSwap = false } = {}) {
     <div class="sheet-section"><div class="rec facts" style="display:flex;padding:0;border:0;background:none">${factChips(sp)}</div></div>
     ${!fit.ok ? `<div class="note-box" style="background:#f6e2d6">Watch out: ${esc(fit.why)} (${esc(area.name)}).</div>` : ""}
     ${sp.note ? `<div class="note-box" style="margin-top:10px">${esc(sp.note)}</div>` : ""}
+    ${planned ? "" : diarySection(p)}
     ${swap}
     <div class="sheet-actions">${actions}</div>`, (body) => {
     body.querySelectorAll("canvas[data-thumb]").forEach((canvas) => { const s = speciesFor(state, canvas.dataset.thumb); if (s) paintThumb(canvas, s, showcaseMonth(s)); });
@@ -778,6 +784,8 @@ function openPlacementSheet(id, { scrollToSwap = false } = {}) {
     const range = body.querySelector("#size-range");
     range?.addEventListener("input", () => { p.size = Number(range.value); save(); renderWalk(); });
     body.querySelectorAll("[data-act]").forEach((btn) => btn.addEventListener("click", () => placementAction(p, btn.dataset.act)));
+    body.querySelectorAll("img[data-photo-src]").forEach(async (img) => { img.src = await photoUrl(img.dataset.photoSrc); });
+    body.querySelectorAll("[data-diary]").forEach((btn) => btn.addEventListener("click", () => openDiaryPhoto(p, btn.dataset.diary)));
     if (scrollToSwap) body.querySelector("#swap-section")?.scrollIntoView({ block: "nearest" });
   });
 }
@@ -813,6 +821,8 @@ function placementAction(p, act) {
     closeSheet();
     if (ui.view !== "walk") switchView("walk");
     setMode({ type: "draw", placementId: p.id }, `Trace round the ${sp.name} with your finger`);
+  } else if (act === "add-photo") {
+    addDiaryPhoto(p);
   } else if (act === "details") {
     fillInDetails(p);
   }
@@ -1151,6 +1161,7 @@ async function renderYear() {
   const placeholder = await photoUrl(spot.photoId);
   $("#year-grid").innerHTML = MON.map((m, i) => `<button class="year-cell${i === ui.month ? " active" : ""}" data-ym="${i}"><img src="${placeholder}" alt="" /><span>${MONTHS[i]}</span>${coverage[i] ? `<em>${coverage[i]} in flower</em>` : ""}</button>`).join("");
   renderCalendar(spot, coverage);
+  renderWeatherCard();
   const order = [...Array(12).keys()].sort((a, b) => ((a - ui.month + 12) % 12) - ((b - ui.month + 12) % 12));
   for (const m of order) {
     try {
@@ -1327,7 +1338,7 @@ async function renderPlants() {
   $("#existing-list").innerHTML = existing.length ? existing.map((p) => {
     const sp = speciesFor(state, p.speciesId);
     const spot = state.spots.find((s) => s.id === p.spotId);
-    return `<div class="row"><span class="num${p.confirmed ? "" : " unconfirmed"}">${numbering(p.spotId).get(p.id)}</span><div class="grow"><strong>${esc(sp?.name)}</strong><small>${esc(spot?.name)}${p.confirmed ? "" : " · to confirm"}${sp?.bloom?.length ? ` · flowers ${monthRange(sp.bloom)}` : ""}</small></div><button class="btn small" data-show="${p.id}">Show</button></div>`;
+    return `<div class="row"><span class="num${p.confirmed ? "" : " unconfirmed"}">${numbering(p.spotId).get(p.id)}</span><div class="grow"><strong>${esc(sp?.name)}</strong><small>${esc(spot?.name)}${p.confirmed ? "" : " · to confirm"}${sp?.bloom?.length ? ` · flowers ${monthRange(sp.bloom)}` : ""}${p.photos?.length ? ` · ${p.photos.length} photo${p.photos.length > 1 ? "s" : ""}` : ""}</small></div><button class="btn small" data-show="${p.id}">Show</button></div>`;
   }).join("") : `<p class="empty">No plants recorded yet.</p>`;
 }
 
@@ -1346,13 +1357,8 @@ function viewMoreSheet(spot) {
     if (a === "photo") {
       const blob = await pickPhoto();
       if (!blob) return;
-      const key = `photo:${uid("spot")}`;
-      await putBlob(key, await resizeBlob(blob, 1600, 0.86));
-      spot.photoId = key;
-      pixelCache.delete(spot.id);
-      [...baseCache.keys()].filter((k) => k.startsWith(`wc:${spot.id}:`)).forEach((k) => baseCache.delete(k));
-      await deleteBlobsWithPrefix(`wc:${spot.id}:`);
-      save(); closeSheet(); refreshCurrentView(); toast("Photo replaced. Repainting…");
+      await replaceSpotPhoto(spot, blob);
+      save(); closeSheet(); refreshCurrentView(); toast("Photo updated. The old one is kept in its history.");
     }
     if (a === "delete") {
       if (!confirm(`Delete "${spot.name}" and its pins?`)) return;
@@ -1364,6 +1370,264 @@ function viewMoreSheet(spot) {
       save(); closeSheet(); refreshCurrentView();
     }
   })));
+}
+
+/* ---------- plant photo diary ---------- */
+const fmtDate = (iso) => (iso ? new Date(`${iso}T12:00:00`).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }) : "");
+function weatherLine(iso) {
+  const w = weatherLog.days[iso];
+  if (!w) return "";
+  const week = lastDays(weatherLog.days, 7, iso).reduce((sum, d) => sum + (d.rain || 0), 0);
+  return `${w.tmin}–${w.tmax}°C · ${w.rain} mm rain (${Math.round(week)} mm that week) · gusts ${Math.round(w.gust)} km/h`;
+}
+function diarySection(p) {
+  const photos = [...(p.photos || [])].sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  const last = photos[0]?.date;
+  const days = last ? Math.round((Date.now() - new Date(`${last}T12:00:00`)) / 864e5) : null;
+  return `<div class="sheet-section"><h3>Photo diary</h3>
+    <div class="diary-strip">
+      <button class="diary-add" data-act="add-photo">+ Add photo</button>
+      ${photos.map((ph) => `<button class="diary-thumb" data-diary="${esc(ph.id)}"><img data-photo-src="${esc(ph.id)}" alt="Photo from ${esc(fmtDate(ph.date))}" /><small>${esc(fmtDate(ph.date))}</small></button>`).join("")}
+    </div>
+    <p class="muted" style="margin:6px 0 0">${photos.length ? `Last photo ${days === 0 ? "today" : `${days} days ago`}. ` : ""}A close-up each month shows how it grows, leafs up and flowers, matched to that day's weather.</p></div>`;
+}
+async function addDiaryPhoto(p) {
+  const blob = await pickPhoto();
+  if (!blob) return;
+  const key = `photo:${uid("diary")}`;
+  await putBlob(key, await resizeBlob(blob, 1600, 0.86));
+  (p.photos ||= []).push({ id: key, date: isoDay(new Date()) });
+  save();
+  openPlacementSheet(p.id);
+  toast(p.confirmed ? "Added to the diary" : "Added. Tap it to identify the plant from this photo.");
+}
+async function openDiaryPhoto(p, photoId) {
+  const ph = (p.photos || []).find((x) => x.id === photoId);
+  if (!ph) return;
+  const sp = speciesFor(state, p.speciesId);
+  openSheet(`<p class="eyebrow">${esc(sp?.name || "Plant")}</p><h2>${esc(fmtDate(ph.date))}</h2>
+    <img class="viewer-img" src="${await photoUrl(ph.id)}" alt="" />
+    ${weatherLine(ph.date) ? `<p class="muted">${esc(weatherLine(ph.date))}</p>` : ""}
+    <div class="sheet-actions"><button class="btn small dark" id="dv-id">Identify from this photo</button><button class="btn small" id="dv-back">Back</button><button class="btn small ghost" id="dv-del">Delete photo</button></div>`, (body) => {
+    body.querySelector("#dv-back").addEventListener("click", () => openPlacementSheet(p.id));
+    body.querySelector("#dv-id").addEventListener("click", async () => identifyFromBlob(await getBlob(ph.id), (id) => { p.speciesId = id; p.confirmed = true; save(); renderWalk(); openPlacementSheet(p.id); }));
+    body.querySelector("#dv-del").addEventListener("click", () => { if (!confirm("Delete this photo?")) return; p.photos = p.photos.filter((x) => x.id !== ph.id); save(); openPlacementSheet(p.id); });
+  });
+}
+
+/* ---------- weather ---------- */
+async function refreshWeather({ fromDate = null, force = false, quiet = true } = {}) {
+  const loc = state.settings.location;
+  if (!loc) return;
+  try {
+    const { log } = await syncWeather(loc, { fromDate, force });
+    weatherLog = log;
+    if (ui.view === "year") renderWeatherCard();
+    if (ui.view === "walk") renderWalkHeader();
+  } catch (error) {
+    console.error(error);
+    if (!quiet) toast(`Weather update failed: ${error.message}`);
+  }
+}
+
+function wxChart(days, kind) {
+  const W = 340, H = 92, padL = 26, padB = 16, padT = 6;
+  const n = days.length, bw = (W - padL) / n;
+  const vals = days.filter((d) => d.tmax != null);
+  if (!vals.length) return "";
+  let lo, hi;
+  if (kind === "temp") { lo = Math.min(0, Math.floor(Math.min(...vals.map((d) => d.tmin)) / 5) * 5); hi = Math.ceil(Math.max(...vals.map((d) => d.tmax)) / 5) * 5; }
+  else { lo = 0; hi = Math.max(5, Math.ceil(Math.max(...vals.map((d) => d.rain)) / 5) * 5); }
+  const y = (v) => padT + (H - padB - padT) * (1 - (v - lo) / (hi - lo || 1));
+  const ticks = kind === "temp" ? [lo, (lo + hi) / 2, hi] : [0, hi / 2, hi];
+  let svg = ticks.map((t) => `<line x1="${padL}" x2="${W}" y1="${y(t)}" y2="${y(t)}" stroke="#e2dac8" stroke-width="1"${t === 0 && kind === "temp" && lo < 0 ? ' stroke-dasharray="3 3" stroke="#9aa8b8"' : ""}/><text x="${padL - 4}" y="${y(t) + 3}" text-anchor="end">${Math.round(t)}${kind === "temp" ? "°" : ""}</text>`).join("");
+  days.forEach((d, i) => {
+    const x = padL + i * bw + bw * 0.18, w = Math.max(2, bw * 0.64);
+    if (d.tmax != null) {
+      if (kind === "temp") svg += `<rect x="${x}" y="${y(d.tmax)}" width="${w}" height="${Math.max(2, y(d.tmin) - y(d.tmax))}" rx="2" fill="#c46f4c"/>`;
+      else if (d.rain > 0) svg += `<rect x="${x}" y="${y(d.rain)}" width="${w}" height="${Math.max(1.5, y(0) - y(d.rain))}" rx="2" fill="#3f7fb8"/>`;
+    }
+    svg += `<rect class="wx-hit" data-i="${i}" x="${padL + i * bw}" y="0" width="${bw}" height="${H}" fill="transparent"/>`;
+    if (i % 7 === 0 && n - 1 - i >= 3) svg += `<text x="${padL + i * bw + bw / 2}" y="${H - 3}" text-anchor="middle">${new Date(`${d.date}T12:00:00`).getDate()} ${MON[new Date(`${d.date}T12:00:00`).getMonth()]}</text>`;
+  });
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${kind === "temp" ? "Daily low to high temperature" : "Daily rainfall"}, last ${n} days">${svg}</svg>`;
+}
+
+function renderWeatherCard() {
+  const card = $("#weather-card");
+  if (!card) return;
+  const loc = state.settings.location;
+  if (!loc) {
+    card.innerHTML = `<div class="card-head"><h2>Weather</h2></div><p class="muted">Set your garden's location to keep a daily log of temperature, rain and wind. Each plant photo is then matched to its weather, so you can compare years.</p><button class="btn dark" id="wx-set">Set location</button>`;
+    card.querySelector("#wx-set").addEventListener("click", openSettings);
+    return;
+  }
+  const days = lastDays(weatherLog.days, 30);
+  const now = new Date();
+  const thisM = monthSummary(weatherLog.days, now.getFullYear(), now.getMonth());
+  const lastY = monthSummary(weatherLog.days, now.getFullYear() - 1, now.getMonth());
+  const stat = (v, label) => `<div class="wx-stat"><b>${v}</b><span>${label}</span></div>`;
+  const rows = [];
+  for (let m = now.getMonth(); m >= 0; m -= 1) {
+    const a = monthSummary(weatherLog.days, now.getFullYear(), m), b = monthSummary(weatherLog.days, now.getFullYear() - 1, m);
+    if (!a) continue;
+    const prev = (v, unit = "") => (b ? `<small>${v(b)}${unit}</small>` : "");
+    rows.push(`<tr><td>${MON[m]}</td><td>${a.tmax}°${prev((x) => x.tmax, "°")}</td><td>${a.tmin}°${prev((x) => x.tmin, "°")}</td><td>${a.rain}${prev((x) => x.rain)}</td><td>${a.frost}${prev((x) => x.frost)}</td></tr>`);
+  }
+  const hasLastYear = Object.keys(weatherLog.days).some((d) => d.startsWith(String(now.getFullYear() - 1)));
+  card.innerHTML = `<div class="card-head"><h2>Weather</h2><span class="muted">${esc(loc.name)}</span></div>
+    ${thisM ? `<div class="wx-stats">${stat(`${thisM.tmax}°`, "avg high")}${stat(`${thisM.tmin}°`, "avg low")}${stat(`${thisM.rain}`, "mm rain")}${stat(thisM.frost, thisM.frost === 1 ? "frost" : "frosts")}</div>
+    <p class="muted" style="margin:0 0 4px">${MONTHS[now.getMonth()]} so far${lastY ? `. Last ${MONTHS[now.getMonth()]}: ${lastY.tmax}° / ${lastY.tmin}°, ${lastY.rain} mm, ${lastY.frost} frosts` : ""}. Strongest gust ${Math.round(thisM.gust)} km/h.</p>` : ""}
+    <div class="wx-chart" id="wx-chart">
+      <h3>Temperature, low to high · last 30 days</h3>${wxChart(days, "temp")}
+      <h3>Rainfall, mm</h3>${wxChart(days, "rain")}
+      <div class="wx-tip" id="wx-tip" hidden></div>
+    </div>
+    ${rows.length ? `<table class="wx-table"><thead><tr><th>${now.getFullYear()}</th><th>Avg high</th><th>Avg low</th><th>Rain mm</th><th>Frosts</th></tr></thead><tbody>${rows.join("")}</tbody></table>${hasLastYear ? `<p class="muted" style="margin:6px 0 0">Small figures: same month last year.</p>` : ""}` : ""}
+    <div class="sheet-actions">${hasLastYear ? "" : `<button class="btn small" id="wx-history">Load previous 3 years</button>`}<button class="btn small ghost" id="wx-refresh">Refresh</button></div>`;
+  const tip = card.querySelector("#wx-tip"), chart = card.querySelector("#wx-chart");
+  chart.querySelectorAll(".wx-hit").forEach((hit) => {
+    const show = () => {
+      const d = days[Number(hit.dataset.i)];
+      if (d.tmax == null) { tip.hidden = true; return; }
+      const r = hit.getBoundingClientRect(), c = chart.getBoundingClientRect();
+      tip.textContent = `${fmtDate(d.date)} · ${d.tmin}–${d.tmax}°C · ${d.rain} mm · gusts ${Math.round(d.gust)} km/h`;
+      tip.style.left = `${Math.min(c.width - 90, Math.max(90, r.left - c.left + r.width / 2))}px`;
+      tip.style.top = `${r.top - c.top + 18}px`;
+      tip.hidden = false;
+    };
+    hit.addEventListener("pointerenter", show);
+    hit.addEventListener("click", show);
+  });
+  chart.addEventListener("pointerleave", () => { tip.hidden = true; });
+  card.querySelector("#wx-refresh").addEventListener("click", () => refreshWeather({ force: true, quiet: false }));
+  card.querySelector("#wx-history")?.addEventListener("click", async (e) => {
+    e.target.disabled = true; e.target.textContent = "Loading…";
+    await refreshWeather({ fromDate: `${now.getFullYear() - 3}-01-01`, quiet: false });
+  });
+}
+
+/* ---------- guided photo walk ---------- */
+async function replaceSpotPhoto(spot, blob) {
+  const key = `photo:${uid("spot")}`;
+  await putBlob(key, await resizeBlob(blob, 1600, 0.86));
+  (spot.history ||= []).push({ photoId: spot.photoId, date: spot.photoDate || null });
+  spot.photoId = key;
+  spot.photoDate = isoDay(new Date());
+  pixelCache.delete(spot.id);
+  [...baseCache.keys()].filter((k) => k.startsWith(`wc:${spot.id}:`)).forEach((k) => baseCache.delete(k));
+  await deleteBlobsWithPrefix(`wc:${spot.id}:`);
+}
+
+function runGuidedWalk({ garden = null } = {}) {
+  return new Promise((resolve) => {
+    const panel = $("#guide");
+    const taken = {};
+    let i = 0;
+    document.body.classList.add("guiding");
+    panel.hidden = false;
+    const close = (result) => { panel.hidden = true; panel.innerHTML = ""; document.body.classList.remove("guiding"); resolve(result); };
+    const render = () => {
+      const step = GUIDE_STEPS[i];
+      const existing = garden?.spots.find((sp) => sp.guideKey === step.key);
+      panel.innerHTML = `<div class="guide-top"><button class="btn small ghost" id="g-cancel">${garden ? "Cancel" : "Back"}</button><div class="guide-dots">${GUIDE_STEPS.map((_, k) => `<i class="${k < i ? "done" : k === i ? "now" : ""}"></i>`).join("")}</div></div>
+        <p class="eyebrow">Photo ${i + 1} of ${GUIDE_STEPS.length}${existing ? " · retake for this season" : ""}</p>
+        <h1>${esc(step.title)}</h1>
+        ${guideDiagram(step)}
+        <p class="lede">${esc(step.text)}</p>
+        <p class="muted" style="margin:0">Hold the phone upright at chest height, the same way each time, so seasons line up.</p>
+        <button class="btn dark onboard-btn" id="g-photo">${taken[step.key] ? "Retake photo ✓" : "Take photo"}</button>
+        ${i > 0 || garden ? `<button class="btn ghost" id="g-skip">${step.optional ? "Skip" : "Skip this one"}</button>` : ""}`;
+      panel.querySelector("#g-cancel").addEventListener("click", () => (i > 0 ? (i -= 1, render()) : close(null)));
+      panel.querySelector("#g-photo").addEventListener("click", async () => {
+        const blob = await pickPhoto();
+        if (!blob) return;
+        taken[step.key] = blob;
+        next();
+      });
+      panel.querySelector("#g-skip")?.addEventListener("click", next);
+    };
+    const next = () => { if (i < GUIDE_STEPS.length - 1) { i += 1; render(); } else finish(); };
+    const finish = async () => {
+      if (!Object.keys(taken).length) { close(null); return; }
+      panel.innerHTML = `<div class="guide-busy"><div class="brush"></div><p class="hand">Laying out your garden…</p></div>`;
+      const g = garden || { version: 2, settings: { gardenName: "My garden", region: "UK", hardiness: 4, soil: "unknown", aspect: "S", aspectConfirmed: false }, startSpotId: null, species: {}, spots: [], placements: [], backdrop: {} };
+      for (const step of GUIDE_STEPS) {
+        const blob = taken[step.key];
+        if (!blob) continue;
+        let spot = g.spots.find((sp) => sp.guideKey === step.key);
+        if (spot) await replaceSpotPhoto(spot, blob);
+        else {
+          const id = uid("spot");
+          await putBlob(`photo:${id}`, await resizeBlob(blob, 1600, 0.86));
+          spot = newSpot(id, step.title, `photo:${id}`);
+          spot.guideKey = step.key;
+          spot.photoDate = isoDay(new Date());
+          spot.areas = GUIDE_AREAS[step.key].map((a) => ({ id: uid("area"), light: "part", moist: "moist", maxH: 3, climbers: true, note: "Set its light and moisture so ideas fit.", ...a }));
+          g.spots.push(spot);
+        }
+      }
+      const byKey = Object.fromEntries(g.spots.filter((sp) => sp.guideKey).map((sp) => [sp.guideKey, sp]));
+      for (const l of GUIDE_LINKS) {
+        const from = byKey[l.from], to = byKey[l.to];
+        if (from && to && !from.links.some((x) => x.to === to.id)) from.links.push({ id: uid("link"), x: l.x, y: l.y, to: to.id, label: l.label });
+      }
+      g.startSpotId ||= (byKey.house || g.spots[0]).id;
+      await setValue("state", g);
+      close(g);
+    };
+    render();
+  });
+}
+
+/* ---------- Excel export ---------- */
+async function exportExcel() {
+  toast("Preparing your spreadsheet…");
+  try {
+    const XLSX = await import("https://esm.sh/xlsx@0.18.5");
+    const LIGHT = { full: "Full sun", part: "Part shade", shade: "Shade" };
+    const plants = state.placements.map((p) => {
+      const sp = speciesFor(state, p.speciesId) || {};
+      const spot = state.spots.find((s) => s.id === p.spotId);
+      const area = spot ? nearestArea(spot, p.x, p.y) : null;
+      const photos = [...(p.photos || [])].sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+      return {
+        "No.": spot ? numbering(spot.id).get(p.id) : "",
+        View: spot?.name || "",
+        Area: area?.name || "",
+        Status: p.status === "planned" ? "Planned" : p.confirmed ? "In the garden" : "In the garden (ID to confirm)",
+        "Common name": sp.name || "",
+        "Latin name": sp.latin || "",
+        Type: sp.type || "",
+        Habit: sp.habit || "",
+        "Height (m)": sp.h ?? "",
+        "Spread (m)": sp.s ?? "",
+        "RHS hardiness": sp.rhs ? `H${sp.rhs}` : "",
+        Light: (sp.sun || []).map((x) => LIGHT[x]).join(", "),
+        Soil: (sp.soil || []).join(", "),
+        Moisture: (sp.moist || []).join(", "),
+        Flowering: monthRange(sp.bloom || []),
+        "Native status": { N: "Native", AR: "Archaeophyte", AN: "Naturalised" }[sp.nativeStatus] || "",
+        "Planted on": p.plantedOn || "",
+        Photos: photos.length,
+        "First photo": photos[0]?.date || "",
+        "Latest photo": photos[photos.length - 1]?.date || "",
+        Notes: sp.note || ""
+      };
+    });
+    const wb = XLSX.utils.book_new();
+    const headers = ["No.", "View", "Area", "Status", "Common name", "Latin name", "Type", "Habit", "Height (m)", "Spread (m)", "RHS hardiness", "Light", "Soil", "Moisture", "Flowering", "Native status", "Planted on", "Photos", "First photo", "Latest photo", "Notes"];
+    const sheet = XLSX.utils.json_to_sheet(plants, { header: headers });
+    sheet["!cols"] = headers.map((k) => ({ wch: Math.min(48, Math.max(8, k.length + 2, ...plants.map((r) => String(r[k] ?? "").length + 1))) }));
+    XLSX.utils.book_append_sheet(wb, sheet, "Plants");
+    const wxRows = Object.entries(weatherLog.days).sort(([a], [b]) => a.localeCompare(b)).map(([date, w]) => ({ Date: date, "Min °C": w.tmin, "Max °C": w.tmax, "Rain mm": w.rain, "Max wind km/h": w.wind, "Max gust km/h": w.gust }));
+    if (wxRows.length) XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(wxRows), "Weather");
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(state.spots.map((sp) => ({ View: sp.name, Plants: state.placements.filter((p) => p.spotId === sp.id && p.status === "existing").length, Planned: state.placements.filter((p) => p.spotId === sp.id && p.status === "planned").length, "Photo taken": sp.photoDate || "", "Earlier photos": (sp.history || []).length }))), "Views");
+    XLSX.writeFile(wb, `forevergarden-plants-${isoDay(new Date())}.xlsx`);
+  } catch (error) {
+    console.error(error);
+    toast(`Couldn't create the spreadsheet: ${error.message}`, 5000);
+  }
 }
 
 /* ---------- settings ---------- */
@@ -1378,13 +1642,40 @@ function openSettings() {
       <label class="field">Soil<select id="st-soil">${opt([["unknown", "Not checked yet"], ["clay", "Clay: sticky, holds a shape when squeezed"], ["loam", "Loam: crumbly, dark"], ["sand", "Sandy: gritty, falls apart"], ["chalk", "Chalky: pale, stony, fizzes with vinegar"]], s.soil)}</select></label>
       <label class="field">Looking out from the house, the garden faces<select id="st-aspect">${opt(Object.entries(ASPECTS).map(([k, v]) => [k, v[0].toUpperCase() + v.slice(1)]), s.aspect)}</select></label>
       ${s.aspectConfirmed ? "" : `<div class="note-box">Stand at the back door facing the garden and check a phone compass. South- and west-facing gardens get the most sun; borders along the far side of a north-facing garden can still be sunny.</div>`}
+      <div class="field"><span>Garden location (for the weather log)</span>
+        <div class="inline-row"><input type="text" id="st-place" value="${esc(s.location?.name || "")}" placeholder="Postcode or town" /><button class="btn small" id="st-find" type="button">Find</button><button class="btn small" id="st-gps" type="button" aria-label="Use my location">Here</button></div>
+        <div class="choice-list" id="st-place-results" style="margin:4px 0 0"></div>
+        <small class="muted" style="font-weight:400">Weather comes from Open-Meteo; only the location is sent.</small>
+      </div>
       <label class="field">Claude API key (for plant ID and ideas)<input type="password" id="st-key" value="${esc(apiKey)}" placeholder="sk-ant-…" autocomplete="off" /></label>
       <p class="muted" style="margin-top:-6px">Stored only on this phone and sent only to Anthropic's API. Photos you scan are sent to Claude for analysis.</p>
       <button class="btn dark" id="st-save">Save</button>
       <div class="sheet-actions"><button class="btn small" id="st-export">Back up garden</button><button class="btn small" id="st-import">Restore backup</button><button class="btn small ghost" id="st-reset">Start over</button></div>
     </div>`, (body) => {
+    let pendingLoc = s.location || null;
+    const results = body.querySelector("#st-place-results");
+    const choose = (loc) => { pendingLoc = loc; body.querySelector("#st-place").value = loc.name; results.innerHTML = ""; };
+    body.querySelector("#st-find").addEventListener("click", async () => {
+      const q = body.querySelector("#st-place").value.trim();
+      if (!q) return;
+      try {
+        const found = await findPlace(q);
+        results.innerHTML = found.length ? found.map((f, k) => `<button class="choice" type="button" data-k="${k}"><span><strong>${esc(f.name)}</strong></span></button>`).join("") : `<p class="muted">No match. Try a postcode.</p>`;
+        results.querySelectorAll("[data-k]").forEach((b) => b.addEventListener("click", () => choose(found[Number(b.dataset.k)])));
+      } catch (error) { toast(`Search failed: ${error.message}`); }
+    });
+    body.querySelector("#st-gps").addEventListener("click", () => {
+      navigator.geolocation?.getCurrentPosition(async (pos) => {
+        const lat = +pos.coords.latitude.toFixed(3), lon = +pos.coords.longitude.toFixed(3);
+        let name = "My garden";
+        try { const r = await (await fetch(`https://api.postcodes.io/postcodes?lon=${lon}&lat=${lat}&limit=1`)).json(); if (r.result?.[0]) name = `${r.result[0].outcode}, ${r.result[0].admin_district}`; } catch { /* name stays generic */ }
+        choose({ name, lat, lon });
+      }, () => toast("Couldn't get your location"), { timeout: 10000 });
+    });
     body.querySelector("#st-save").addEventListener("click", async () => {
       const oldSoil = s.soil, oldHardy = s.hardiness;
+      const locChanged = pendingLoc && (!s.location || pendingLoc.lat !== s.location.lat || pendingLoc.lon !== s.location.lon);
+      if (pendingLoc) s.location = pendingLoc;
       s.gardenName = body.querySelector("#st-name").value.trim() || "My garden";
       s.region = body.querySelector("#st-region").value.trim() || "UK";
       s.hardiness = Number(body.querySelector("#st-hardy").value);
@@ -1398,6 +1689,7 @@ function openSettings() {
       $("#garden-name").textContent = s.gardenName;
       refreshCurrentView();
       toast(oldSoil !== s.soil || oldHardy !== s.hardiness ? "Saved. Recommendations updated for your conditions." : "Saved");
+      if (locChanged) { toast("Fetching this year's weather…"); refreshWeather({ fromDate: `${new Date().getFullYear()}-01-01`, force: true, quiet: false }); }
     });
     body.querySelector("#st-export").addEventListener("click", exportGarden);
     body.querySelector("#st-import").addEventListener("click", () => $("#import-input").click());
@@ -1538,6 +1830,11 @@ function bindEvents() {
     setMode({ type: "place", speciesId: id, status: "existing" }, `Tap where ${sp.name} grows in this view`);
   }));
   $("#new-view-btn").addEventListener("click", () => newView());
+  $("#excel-btn").addEventListener("click", exportExcel);
+  $("#guided-btn").addEventListener("click", async () => {
+    const g = await runGuidedWalk({ garden: state });
+    if (g) { state = g; save(); ui.spotId = state.startSpotId; switchView("walk"); toast("Photos saved. Earlier ones are kept for comparison."); }
+  });
   $("#views-list").addEventListener("click", (e) => {
     const btn = e.target.closest("[data-view-act]");
     if (!btn) return;
@@ -1577,6 +1874,14 @@ function onboarding() {
         toast(`Couldn't use that photo: ${error.message}`);
       }
     });
+    $("#onboard-guided").addEventListener("click", async () => {
+      const garden = await runGuidedWalk();
+      if (!garden) return;
+      panel.hidden = true;
+      document.body.classList.remove("onboarding");
+      $("#import-input").onchange = null;
+      resolve(garden);
+    });
     $("#onboard-restore").addEventListener("click", () => $("#import-input").click());
     $("#import-input").onchange = (e) => { const f = e.target.files?.[0]; if (f) importGarden(f); };
   });
@@ -1593,6 +1898,8 @@ async function init() {
     return;
   }
   if (!state) { state = await onboarding(); firstRun = true; }
+  weatherLog = await loadWeather().catch(() => ({ days: {} }));
+  refreshWeather();
   restoreUi();
   ui.month = new Date().getMonth();
   if (!state.spots.some((s) => s.id === ui.spotId)) ui.spotId = state.startSpotId || state.spots[0].id;
@@ -1603,7 +1910,8 @@ async function init() {
     setTimeout(() => openSheet(`<p class="eyebrow">Welcome to your garden</p><h2>Sketched from your photo</h2>
       <div class="stack" style="font-size:14.5px;line-height:1.55">
         <p style="margin:0"><strong>Find your plants:</strong> let Claude spot them in this photo, or switch on <strong>Edit</strong> and tap a plant to tag it.</p>
-        <p style="margin:0"><strong>Grow your walk:</strong> in Edit, tap a corner and choose "Make a path", then take a photo from there.</p>
+        <p style="margin:0"><strong>Tap any plant</strong> to outline it and say what it is. Search ~1,800 UK plants, or identify it from the photo.</p>
+        <p style="margin:0"><strong>Walk round:</strong> tap the arrows to move between views. Add more with "Make a path" in Edit.</p>
         <p style="margin:0">Tap the <strong>months</strong> to see the garden change, or press ▶ to play the year.</p>
         <div class="sheet-actions" style="margin-top:4px">
           <button class="btn dark" id="welcome-scan">Find plants with Claude</button>
