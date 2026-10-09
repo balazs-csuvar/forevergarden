@@ -1,11 +1,12 @@
 import { getValue, setValue, getBlob, putBlob, deleteBlobsWithPrefix, uid } from "./store.js";
-import { PLANTS } from "./plants.js";
+import { searchPlants, SOURCE_LABEL } from "./plant-index.js";
+import { segmentAt, pointInPoly, polyBounds } from "./segment.js";
 import { buildFirstGarden, newSpot } from "./seed.js";
 import { paintPlant, paintExistingSeason, plantState } from "./painter.js";
 import { MONTHS, MON, monthRange, nearestArea, bloomCoverage, speciesFor, recommendFor, describeConditions, fitsConditions } from "./recommend.js";
 import * as ai from "./ai.js";
 
-const ENGINE = "sk3";
+const ENGINE = "sk4";
 const WORK_SIZE = 960;
 const SEASON_COLORS = ["#a7b6c8", "#b3c0c9", "#c3d39a", "#a6cf7a", "#8cc46a", "#e2a6bd", "#e6c25a", "#dba94a", "#c99a4a", "#c9773e", "#a86a48", "#9aa8b8"];
 const LIGHT_LABEL = { full: "Full sun (6h+)", part: "Part shade (3–6h)", shade: "Shade (<3h)" };
@@ -45,6 +46,7 @@ function toast(message, ms = 2800) {
 }
 const sheet = $("#sheet");
 function openSheet(html, bind) {
+  if (!html.includes('id="tag-q"')) sheet.classList.remove("compact");
   $("#sheet-body").innerHTML = html;
   if (!sheet.open) sheet.show();
   $("#sheet-body").scrollTop = 0;
@@ -52,6 +54,8 @@ function openSheet(html, bind) {
 }
 function closeSheet() {
   if (sheet.open) sheet.close();
+  sheet.classList.remove("compact");
+  if (ui.draft && ui.mode?.type !== "draw") { ui.draft = null; if (ui.view === "walk") renderOverlay(); }
   ui.sheetPlacement = null;
   document.querySelectorAll(".pin.selected").forEach((pin) => pin.classList.remove("selected"));
 }
@@ -157,7 +161,7 @@ function habitKind(sp) {
 function pinsFor(spot) {
   const pins = state.placements
     .filter((p) => p.spotId === spot.id && p.status === "existing")
-    .map((p) => ({ x: p.x, y: p.y, r: p.r || 0.06, kind: habitKind(speciesFor(state, p.speciesId)) }));
+    .map((p) => ({ x: p.x, y: p.y, r: p.r || 0.06, kind: habitKind(speciesFor(state, p.speciesId)), poly: p.outline || null }));
   return pins.concat(state.backdrop?.[spot.id] || []);
 }
 function hashStr(text) {
@@ -416,7 +420,33 @@ function renderOverlay() {
     return `<button class="${cls}" data-pin="${p.id}" style="left:${p.x * 100}%;top:${y * 100}%" aria-label="${esc(sp.name)}"><span class="dot">${nums.get(p.id)}</span><span class="tag">${esc(shortName(sp))}</span></button>`;
   });
   const links = (spot.links || []).map((link) => `<button class="hotspot${link.to ? "" : " empty"}" data-link="${link.id}" style="left:${link.x * 100}%;top:${link.y * 100}%" aria-label="${esc(link.to ? `Walk to ${link.label}` : `${link.label}: no photo yet`)}"><span class="ring"><svg viewBox="0 0 24 24">${link.to ? '<path d="m6 15 6-6 6 6"/><path d="m6 20 6-6 6 6" opacity=".45"/>' : '<path d="M12 6v12M6 12h12"/>'}</svg></span><span class="label">${esc(link.label)}</span></button>`);
-  overlay.innerHTML = links.join("") + pins.join("");
+  const outlines = state.placements.filter((p) => p.spotId === spot.id && p.outline?.length > 2).map((p) =>
+    `<polygon class="${p.confirmed ? "" : "unconfirmed"}${ui.sheetPlacement === p.id ? " selected" : ""}" points="${p.outline.map(([x, y]) => `${(x * 1000).toFixed(1)},${(y * 1000).toFixed(1)}`).join(" ")}" />`);
+  const draft = ui.draft?.seg?.poly ? `<polygon class="draft" points="${ui.draft.seg.poly.map(([x, y]) => `${(x * 1000).toFixed(1)},${(y * 1000).toFixed(1)}`).join(" ")}" />` : "";
+  const svg = `<svg class="outlines" viewBox="0 0 1000 1000" preserveAspectRatio="none" aria-hidden="true">${outlines.join("")}${draft}</svg>`;
+  overlay.innerHTML = svg + links.join("") + pins.join("");
+}
+
+// Which recorded plant (if any) is under this point: outline first, then the pin's circle.
+function placementAt(x, y) {
+  const spot = currentSpot();
+  const aspect = sceneSize.h / Math.max(1, sceneSize.w);
+  let best = null, bestArea = Infinity;
+  for (const p of state.placements) {
+    if (p.spotId !== spot.id || p.status !== "existing") continue;
+    let hit = false, area;
+    if (p.outline?.length > 2) {
+      hit = pointInPoly(x, y, p.outline);
+      const b = polyBounds(p.outline);
+      area = (b.x1 - b.x0) * (b.y1 - b.y0);
+    } else {
+      const r = p.r || 0.05;
+      hit = Math.hypot(x - p.x, (y - p.y) * aspect) < r * 0.8;
+      area = r * r;
+    }
+    if (hit && area < bestArea) { best = p; bestArea = area; }
+  }
+  return best;
 }
 
 function sceneRel(event) {
@@ -429,9 +459,11 @@ function setupStageGestures() {
   const pointers = new Map();
   let gesture = null;
   let lastTap = 0;
+  let drawing = null;
   stage.addEventListener("pointerdown", (event) => {
     if (event.target.closest(".pin, .hotspot, .round-tool, .banner")) return;
     stage.setPointerCapture(event.pointerId);
+    if (ui.mode?.type === "draw") { drawing = [sceneRel(event)]; ui.draft = { seg: { poly: [] } }; return; }
     pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
     if (pointers.size === 1) gesture = { type: "pan", sx: event.clientX, sy: event.clientY, vx: view.x, vy: view.y, moved: false };
     else if (pointers.size === 2) {
@@ -440,6 +472,16 @@ function setupStageGestures() {
     }
   });
   stage.addEventListener("pointermove", (event) => {
+    if (drawing) {
+      const pt = sceneRel(event);
+      const last = drawing[drawing.length - 1];
+      if (Math.hypot(pt.x - last.x, pt.y - last.y) > 0.006) {
+        drawing.push(pt);
+        ui.draft.seg.poly = drawing.map(({ x, y }) => [Math.min(1, Math.max(0, x)), Math.min(1, Math.max(0, y))]);
+        renderOverlay();
+      }
+      return;
+    }
     if (!pointers.has(event.pointerId) || !gesture) return;
     pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
     if (gesture.type === "pan") {
@@ -452,6 +494,7 @@ function setupStageGestures() {
     }
   });
   const end = (event) => {
+    if (drawing) { finishDrawing(drawing); drawing = null; return; }
     if (!pointers.has(event.pointerId)) return;
     pointers.delete(event.pointerId);
     if (gesture?.type === "pan" && !gesture.moved && event.type === "pointerup") {
@@ -475,7 +518,140 @@ function handleStageTap(event) {
   if (x < 0 || x > 1 || y < 0 || y > 1) return;
   if (ui.mode) { placeAt(x, y); return; }
   if (ui.edit) { openHereSheet(x, y); return; }
-  if (sheet.open) closeSheet();
+  const hit = placementAt(x, y);
+  if (hit) { openPlacementSheet(hit.id); return; }
+  outlineAt(x, y);
+}
+
+/* ---------- tap a plant: outline it, then tag it ---------- */
+async function outlineAt(x, y, looseness = 1) {
+  const spot = currentSpot();
+  try {
+    const px = await spotPixels(spot);
+    const seg = segmentAt(px, x, y, looseness);
+    if (!seg) { toast("Couldn't find a plant there. Try tapping its middle, or draw it."); return; }
+    ui.draft = { x, y, looseness, seg, spotId: spot.id };
+    renderOverlay();
+    openTagSheet();
+  } catch (error) {
+    console.error(error);
+    toast(`Outline failed: ${error.message}`);
+  }
+}
+
+function finishDrawing(points) {
+  const target = ui.mode?.placementId;
+  setMode(null);
+  if (points.length < 6) { ui.draft = null; renderOverlay(); toast("Draw all the way round the plant"); return; }
+  const poly = points.map(({ x, y }) => [+Math.min(1, Math.max(0, x)).toFixed(4), +Math.min(1, Math.max(0, y)).toFixed(4)]);
+  let area = 0, cx = 0, cy = 0;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const c = poly[j][0] * poly[i][1] - poly[i][0] * poly[j][1];
+    area += c; cx += (poly[j][0] + poly[i][0]) * c; cy += (poly[j][1] + poly[i][1]) * c;
+  }
+  area /= 2;
+  const seg = Math.abs(area) > 1e-5 ? { poly, cx: cx / (6 * area), cy: cy / (6 * area), area: Math.abs(area), r: Math.sqrt(Math.abs(area) / Math.PI) } : null;
+  if (!seg) { ui.draft = null; renderOverlay(); return; }
+  if (target) {
+    const p = state.placements.find((item) => item.id === target);
+    Object.assign(p, { outline: seg.poly, x: seg.cx, y: seg.cy, r: seg.r });
+    ui.draft = null;
+    save(); renderWalk(); openPlacementSheet(p.id);
+    return;
+  }
+  ui.draft = { x: seg.cx, y: seg.cy, looseness: 1, seg, spotId: currentSpot().id, drawn: true };
+  renderOverlay();
+  openTagSheet();
+}
+
+function discardDraft() {
+  ui.draft = null;
+  renderOverlay();
+}
+
+function tagDraftAs(speciesId, confirmed = true) {
+  const d = ui.draft;
+  if (!d) return;
+  const p = { id: uid("pl"), spotId: d.spotId, speciesId, status: "existing", x: d.seg.cx, y: d.seg.cy, r: d.seg.r, outline: d.seg.poly, confirmed, photos: [] };
+  if (d.photoKey) p.photos.push({ id: d.photoKey, date: new Date().toISOString().slice(0, 10) });
+  state.placements.push(p);
+  ui.draft = null;
+  save();
+  renderWalk();
+  openPlacementSheet(p.id);
+  toast(`${speciesFor(state, speciesId)?.name || "Plant"} tagged`);
+}
+
+function plantResults(q) {
+  const list = searchPlants(q, Object.values(state.species).filter((sp) => sp.source !== "claude-idea"), 8);
+  return list.map((sp) => `<button class="choice" data-sp="${esc(sp.id)}"><span style="width:14px;height:14px;border-radius:50%;flex:none;background:${esc(sp.flower || sp.foliage)}"></span><span><strong>${esc(sp.name)}</strong><small><em>${esc(sp.latin)}</em> · ${esc(SOURCE_LABEL[sp.source] || sp.type || "")}${sp.bloom?.length ? ` · ${monthRange(sp.bloom)}` : ""}</small></span></button>`).join("")
+    || `<p class="muted">No match in the UK list. You can add it by name.</p>`;
+}
+
+function openTagSheet() {
+  const d = ui.draft;
+  sheet.classList.add("compact");
+  openSheet(`<p class="eyebrow">New plant</p><h2>What's this plant?</h2>
+    <div class="outline-tools">
+      <span class="muted">Outline</span>
+      ${d.drawn ? "" : `<button class="btn small" data-o="tighter">Tighter</button><button class="btn small" data-o="looser">Looser</button>`}
+      <button class="btn small" data-o="draw">Draw it myself</button>
+    </div>
+    <div class="stack">
+      <input type="search" id="tag-q" placeholder="Type a name, e.g. hawthorn, lavender, Acer" autocomplete="off" />
+      <div class="choice-list" id="tag-results" style="margin:0"></div>
+      <div class="sheet-actions" style="margin-top:4px">
+        <button class="btn small dark" id="tag-identify">Identify from this photo</button>
+        <button class="btn small" id="tag-closeup">Take a close-up</button>
+        <button class="btn small" id="tag-custom">Add by name</button>
+        <button class="btn small ghost" id="tag-unsure">Not sure yet</button>
+      </div>
+    </div>`, (body) => {
+    const results = body.querySelector("#tag-results");
+    const bind = () => results.querySelectorAll("[data-sp]").forEach((btn) => btn.addEventListener("click", () => tagDraftAs(btn.dataset.sp)));
+    const q = body.querySelector("#tag-q");
+    q.addEventListener("input", () => { results.innerHTML = q.value.trim() ? plantResults(q.value) : ""; bind(); });
+    body.querySelectorAll("[data-o]").forEach((btn) => btn.addEventListener("click", () => {
+      const o = btn.dataset.o;
+      if (o === "draw") { closeSheetKeepDraft(); setMode({ type: "draw" }, "Trace round the plant with your finger"); return; }
+      outlineAt(d.x, d.y, d.looseness * (o === "tighter" ? 0.75 : 1.35));
+    }));
+    body.querySelector("#tag-identify").addEventListener("click", async () => {
+      const crop = await cropFromView(currentSpot(), d.seg.poly);
+      identifyFromBlob(crop, (id) => tagDraftAs(id), { onNone: () => openTagSheet() });
+    });
+    body.querySelector("#tag-closeup").addEventListener("click", async () => {
+      const blob = await pickPhoto();
+      if (!blob) return;
+      identifyFromBlob(blob, (id) => tagDraftAs(id), { keepPhoto: true, onNone: () => openTagSheet() });
+    });
+    body.querySelector("#tag-custom").addEventListener("click", () => customSpeciesForm((id) => tagDraftAs(id), { name: q.value.trim() }));
+    body.querySelector("#tag-unsure").addEventListener("click", () => {
+      const sp = normalizeSpecies({ name: "Unidentified plant", habit: "deciduous", form: "mound", h: 1, note: "Tagged without a name. Add a close-up when it's in leaf or flower to identify it." }, "custom");
+      state.species[sp.id] = sp;
+      tagDraftAs(sp.id, false);
+    });
+  });
+}
+
+function closeSheetKeepDraft() {
+  if (sheet.open) sheet.close();
+}
+
+// Crop the outlined area (with a margin) from the full-resolution photo, for identification.
+async function cropFromView(spot, poly) {
+  const blob = await getBlob(spot.photoId);
+  const bitmap = await createImageBitmap(blob, { imageOrientation: "from-image" });
+  const b = poly?.length ? polyBounds(poly) : { x0: 0, y0: 0, x1: 1, y1: 1 };
+  const padX = (b.x1 - b.x0) * 0.15 + 0.02, padY = (b.y1 - b.y0) * 0.15 + 0.02;
+  const x0 = Math.max(0, b.x0 - padX) * bitmap.width, y0 = Math.max(0, b.y0 - padY) * bitmap.height;
+  const x1 = Math.min(1, b.x1 + padX) * bitmap.width, y1 = Math.min(1, b.y1 + padY) * bitmap.height;
+  const scale = Math.min(1, 1400 / Math.max(x1 - x0, y1 - y0));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round((x1 - x0) * scale));
+  canvas.height = Math.max(1, Math.round((y1 - y0) * scale));
+  canvas.getContext("2d").drawImage(bitmap, x0, y0, x1 - x0, y1 - y0, 0, 0, canvas.width, canvas.height);
+  return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
 }
 
 function setMode(mode, message) {
@@ -484,11 +660,12 @@ function setMode(mode, message) {
   if (!mode) { banner.hidden = true; return; }
   banner.innerHTML = `<span>${esc(message)}</span><button id="banner-cancel">Cancel</button>`;
   banner.hidden = false;
-  $("#banner-cancel").onclick = () => setMode(null);
+  $("#banner-cancel").onclick = () => { if (ui.mode?.type === "draw") discardDraft(); setMode(null); };
 }
 
 function placeAt(x, y) {
   const mode = ui.mode;
+  if (mode.type === "draw") return;
   const spot = currentSpot();
   let placement;
   if (mode.type === "move") {
@@ -578,7 +755,7 @@ function openPlacementSheet(id, { scrollToSwap = false } = {}) {
     <div class="sheet-section"><h3>Size shown</h3><div class="size-row"><small>Young</small><input type="range" min="0.35" max="1.3" step="0.05" value="${p.size || 1}" id="size-range" aria-label="Plant size" /><small>Mature</small></div></div>` : "";
   const actions = planned
     ? `<button class="btn small" data-act="move">Move</button><button class="btn small" data-act="planted">I've planted it</button><button class="btn small ghost" data-act="remove">Remove</button>`
-    : `<button class="btn small dark" data-act="identify">Identify from a close-up</button><button class="btn small" data-act="choose">Choose from list</button>${p.confirmed ? "" : `<button class="btn small" data-act="confirm">That's right</button>`}<button class="btn small" data-act="move">Move pin</button><button class="btn small ghost" data-act="remove">Remove</button>`;
+    : `<button class="btn small dark" data-act="identify">Identify from a close-up</button>${p.outline ? `<button class="btn small" data-act="identify-view">Identify from this photo</button>` : ""}<button class="btn small" data-act="choose">Change plant</button>${p.confirmed ? "" : `<button class="btn small" data-act="confirm">That's right</button>`}${needsDetails(sp) ? `<button class="btn small" data-act="details">Fill in details</button>` : ""}<button class="btn small" data-act="redraw">${p.outline ? "Redraw outline" : "Draw outline"}</button><button class="btn small ghost" data-act="remove">Remove</button>`;
   openSheet(`
     ${statusChip}
     <h2 style="margin-top:8px">${esc(sp.name)}</h2>
@@ -630,6 +807,33 @@ function placementAction(p, act) {
     pickSpecies({ title: "What is it?", onPick: (id) => { p.speciesId = id; p.confirmed = true; save(); renderWalk(); openPlacementSheet(p.id); } });
   } else if (act === "identify") {
     identifyFlow((id) => { p.speciesId = id; p.confirmed = true; save(); renderWalk(); openPlacementSheet(p.id); }, p);
+  } else if (act === "identify-view") {
+    cropFromView(state.spots.find((s) => s.id === p.spotId), p.outline).then((crop) => identifyFromBlob(crop, (id) => { p.speciesId = id; p.confirmed = true; save(); renderWalk(); openPlacementSheet(p.id); }));
+  } else if (act === "redraw") {
+    closeSheet();
+    if (ui.view !== "walk") switchView("walk");
+    setMode({ type: "draw", placementId: p.id }, `Trace round the ${sp.name} with your finger`);
+  } else if (act === "details") {
+    fillInDetails(p);
+  }
+}
+
+const needsDetails = (sp) => sp && (sp.source === "uk-native" || (!sp.bloom?.length && sp.source === "custom"));
+
+async function fillInDetails(p) {
+  const sp = speciesFor(state, p.speciesId);
+  if (!apiKey) { toast("Add your Claude API key in Settings to fill in details"); openSettings(); return; }
+  openSheet(`<h2>Looking up ${esc(sp.name)}…</h2><p class="muted">Getting flowering time, colours, size and growing conditions.</p><div class="brush" style="margin:20px auto"></div>`);
+  try {
+    const details = await ai.describeSpecies(apiKey, sp.name, sp.latin, gardenContext());
+    const full = normalizeSpecies({ ...details, name: details.name || sp.name, latin: details.latin || sp.latin }, "claude-details");
+    if (sp.nativeStatus) full.nativeStatus = sp.nativeStatus;
+    state.species[full.id] = full;
+    state.placements.filter((item) => item.speciesId === sp.id).forEach((item) => { item.speciesId = full.id; });
+    save(); renderWalk(); openPlacementSheet(p.id);
+  } catch (error) {
+    console.error(error);
+    openSheet(`<h2>Couldn't fill in details</h2><p class="muted">${esc(error.message)}</p>`);
   }
 }
 
@@ -759,13 +963,8 @@ function askText(title, placeholder, value = "") {
 }
 
 /* ---------- species picking & identification ---------- */
-function allSpecies() {
-  return [...Object.values(state.species), ...PLANTS];
-}
 function pickSpecies({ title, onPick, identify = true }) {
-  const list = allSpecies();
-  const render = (q) => list.filter((sp) => !q || `${sp.name} ${sp.latin}`.toLowerCase().includes(q)).slice(0, 40)
-    .map((sp) => `<button class="choice" data-sp="${esc(sp.id)}"><span style="width:14px;height:14px;border-radius:50%;flex:none;background:${esc(sp.flower || sp.foliage)}"></span><span><strong>${esc(sp.name)}</strong><small>${esc(sp.latin)}${sp.bloom?.length ? ` · ${monthRange(sp.bloom)}` : ""}</small></span></button>`).join("") || `<p class="muted">Nothing matches. Add it by name below.</p>`;
+  const render = (q) => plantResults(q);
   openSheet(`<h2>${esc(title)}</h2>
     <div class="stack">
       ${identify ? `<button class="btn dark" id="pick-identify"><svg viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="14" rx="2"/><circle cx="12" cy="13" r="3.5"/></svg>Identify from a photo</button>` : ""}
@@ -775,9 +974,9 @@ function pickSpecies({ title, onPick, identify = true }) {
     </div>`, (body) => {
     const bindList = () => body.querySelectorAll("[data-sp]").forEach((btn) => btn.addEventListener("click", () => onPick(btn.dataset.sp)));
     bindList();
-    body.querySelector("#pick-q").addEventListener("input", (e) => { body.querySelector("#pick-list").innerHTML = render(e.target.value.trim().toLowerCase()); bindList(); });
+    body.querySelector("#pick-q").addEventListener("input", (e) => { body.querySelector("#pick-list").innerHTML = render(e.target.value.trim()); bindList(); });
     body.querySelector("#pick-identify")?.addEventListener("click", () => identifyFlow(onPick));
-    body.querySelector("#pick-custom").addEventListener("click", () => customSpeciesForm(onPick));
+    body.querySelector("#pick-custom").addEventListener("click", () => customSpeciesForm(onPick, { name: body.querySelector("#pick-q").value.trim() }));
   });
 }
 
@@ -853,9 +1052,13 @@ function gardenContext() {
 async function identifyFlow(onPick, placement = null) {
   const blob = await pickPhoto();
   if (!blob) return;
+  identifyFromBlob(blob, onPick, { placement, keepPhoto: true });
+}
+
+async function identifyFromBlob(blob, onPick, { placement = null, keepPhoto = false, onNone = null } = {}) {
   if (!apiKey) {
-    toast("Add a Claude API key in Settings for photo ID. Add it by name for now.", 4000);
-    customSpeciesForm(onPick);
+    toast("Add a Claude API key in Settings for photo ID. Search by name for now.", 4000);
+    if (onNone) onNone(); else customSpeciesForm(onPick);
     return;
   }
   openSheet(`<h2>Looking closely…</h2><p class="muted">Claude is identifying your plant. This takes a few seconds.</p><div class="brush" style="margin:20px auto"></div>`);
@@ -874,11 +1077,12 @@ async function identifyFlow(onPick, placement = null) {
         const sp = normalizeSpecies(candidates[Number(btn.dataset.i)], "claude-id");
         sp.photoId = photoKey;
         state.species[sp.id] = sp;
-        if (placement) placement.photoId = photoKey;
+        if (keepPhoto && placement) (placement.photos ||= []).push({ id: photoKey, date: new Date().toISOString().slice(0, 10) });
+        if (keepPhoto && ui.draft) ui.draft.photoKey = photoKey;
         save();
         onPick(sp.id);
       }));
-      body.querySelector("#id-none").addEventListener("click", () => customSpeciesForm(onPick));
+      body.querySelector("#id-none").addEventListener("click", () => (onNone ? onNone() : customSpeciesForm(onPick)));
     });
   } catch (error) {
     console.error(error);

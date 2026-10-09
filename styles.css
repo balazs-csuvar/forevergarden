@@ -115,6 +115,15 @@ main { padding-bottom: calc(var(--tabs) + var(--safe-b) + 16px); }
 .stone.active { border-color: var(--deep); box-shadow: inset 0 0 0 1px var(--deep); }
 .stone.add { color: var(--sage); padding: 4px 12px; }
 
+.outlines { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+.outlines polygon { fill: rgba(255, 252, 240, 0.06); stroke: rgba(47, 63, 44, 0.75); stroke-width: 1.6; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+.outlines polygon.unconfirmed { stroke-dasharray: 5 4; }
+.outlines polygon.selected { stroke: var(--gold); stroke-width: 2.6; fill: rgba(214, 166, 64, 0.12); }
+.outlines polygon.draft { stroke: var(--terra); stroke-width: 2.6; stroke-dasharray: 7 5; fill: rgba(196, 111, 76, 0.14); animation: march 1s linear infinite; }
+@keyframes march { to { stroke-dashoffset: -24; } }
+.overlay.no-labels .outlines polygon:not(.draft):not(.selected) { display: none; }
+.outline-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 6px 0 12px; }
+
 /* PAGES */
 .page-head { padding: 22px 16px 10px; }
 .eyebrow { margin: 0 0 4px; font-size: 11px; letter-spacing: 1.2px; text-transform: uppercase; color: var(--muted); font-weight: 700; }
@@ -198,6 +207,7 @@ textarea { resize: vertical; margin: 10px 0; }
 .sheet[open] { display: flex; flex-direction: column; animation: sheetUp 0.25s ease both; }
 @keyframes sheetUp { from { transform: translateY(30px); opacity: 0; } to { transform: none; opacity: 1; } }
 .sheet::backdrop { background: rgba(30, 25, 15, 0.25); }
+.sheet.compact { max-height: 46dvh; }
 .sheet-grip { width: 40px; height: 4px; border-radius: 4px; background: var(--line); margin: 8px auto 0; flex: none; }
 .sheet-close { position: absolute; right: 12px; top: 12px; z-index: 2; }
 .sheet-body { overflow-y: auto; padding: 10px 18px calc(18px + var(--safe-b)); }

@@ -84,7 +84,30 @@ function hslToRgb(h, s, l) {
 
 function buildDeciduousMap(w, h, pins) {
   const map = new Float32Array(w * h).fill(0.55);
+  // Outlined plants: fill the traced shape exactly, then feather the edge.
+  let anyPoly = false;
   for (const pin of pins) {
+    if (!pin.poly || pin.poly.length < 3) continue;
+    anyPoly = true;
+    let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
+    for (const [px, py] of pin.poly) { x0 = Math.min(x0, px); y0 = Math.min(y0, py); x1 = Math.max(x1, px); y1 = Math.max(y1, py); }
+    const poly = pin.poly.map(([px, py]) => [px * w, py * h]);
+    for (let y = Math.max(0, Math.floor(y0 * h)); y <= Math.min(h - 1, Math.ceil(y1 * h)); y += 1) {
+      // Scanline fill: find crossings for this row.
+      const xs = [];
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const [xi, yi] = poly[i], [xj, yj] = poly[j];
+        if ((yi > y) !== (yj > y)) xs.push(xi + ((y - yi) / (yj - yi)) * (xj - xi));
+      }
+      xs.sort((a, b) => a - b);
+      for (let k = 0; k + 1 < xs.length; k += 2) {
+        for (let x = Math.max(0, Math.ceil(xs[k])); x <= Math.min(w - 1, Math.floor(xs[k + 1])); x += 1) map[y * w + x] = pin.kind;
+      }
+    }
+  }
+  if (anyPoly) boxBlur(map, w, h, Math.max(2, Math.round(w / 220)), 2);
+  for (const pin of pins) {
+    if (pin.poly && pin.poly.length >= 3) continue;
     const cx = pin.x * w, cy = pin.y * h, rad = Math.max(4, pin.r * w);
     const x0 = Math.max(0, Math.floor(cx - rad * 1.6)), x1 = Math.min(w - 1, Math.ceil(cx + rad * 1.6));
     const y0 = Math.max(0, Math.floor(cy - rad * 1.6)), y1 = Math.min(h - 1, Math.ceil(cy + rad * 1.6));

@@ -112,6 +112,13 @@ export async function suggestPlants(apiKey, brief) {
   return ask(apiKey, { schema, effort: "high", content: [{ type: "text", text: brief }] });
 }
 
+export async function describeSpecies(apiKey, name, latin, context) {
+  return ask(apiKey, {
+    schema: speciesSchema(),
+    content: [{ type: "text", text: `Give accurate UK growing data for ${name}${latin ? ` (${latin})` : ""}, as it grows in a garden (${context}). Use typical UK flowering months and realistic colours.` }]
+  });
+}
+
 export async function fileToBase64Jpeg(blob, maxSize = 1280, quality = 0.85) {
   const bitmap = await createImageBitmap(blob, { imageOrientation: "from-image" });
   const scale = Math.min(1, maxSize / Math.max(bitmap.width, bitmap.height));

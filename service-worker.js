@@ -1,7 +1,7 @@
-const CACHE_NAME = "forevergarden-v4";
+const CACHE_NAME = "forevergarden-v5";
 const APP_FILES = [
   "./", "./index.html", "./styles.css", "./manifest.json",
-  "./js/app.js", "./js/store.js", "./js/plants.js", "./js/seed.js", "./js/painter.js", "./js/recommend.js", "./js/ai.js", "./js/watercolour-worker.js",
+  "./js/app.js", "./js/store.js", "./js/plants.js", "./js/seed.js", "./js/painter.js", "./js/recommend.js", "./js/ai.js", "./js/watercolour-worker.js", "./js/plant-index.js", "./js/garden-centre.js", "./js/uk-natives.js", "./js/segment.js",
   "./icons/icon-192.png", "./icons/icon-512.png"
 ];
 

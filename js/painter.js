@@ -342,7 +342,18 @@ export function paintPlant(ctx, W, H, placement, sp, month, spot) {
 export function paintExistingSeason(ctx, W, H, placement, sp, month) {
   const rnd = seededRandom(placement.id + month);
   const st = plantState(sp, month);
-  const cx = placement.x * W, cy = placement.y * H, r = placement.r * W;
+  let cx = placement.x * W, cy = placement.y * H, r = placement.r * W;
+  // Outlined plants: keep the season's flowers and tints inside the traced shape.
+  ctx.save();
+  if (placement.outline?.length > 2) {
+    ctx.beginPath();
+    placement.outline.forEach(([px, py], i) => (i ? ctx.lineTo(px * W, py * H) : ctx.moveTo(px * W, py * H)));
+    ctx.closePath();
+    ctx.clip();
+    let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
+    for (const [px, py] of placement.outline) { x0 = Math.min(x0, px); y0 = Math.min(y0, py); x1 = Math.max(x1, px); y1 = Math.max(y1, py); }
+    cx = ((x0 + x1) / 2) * W; cy = ((y0 + y1) / 2) * H; r = Math.max((x1 - x0) * W, (y1 - y0) * H) * 0.62;
+  }
   if (sp.flower && st.flowering > 0 && sp.form !== "tree") {
     dabs(ctx, cx, cy, r * 0.7, r * 0.55, sp.flower, Math.round((14 + r * 0.25) * st.flowering), Math.max(1.5, r * 0.05), rnd);
   } else if (sp.flower && st.flowering > 0) {
@@ -354,4 +365,5 @@ export function paintExistingSeason(ctx, W, H, placement, sp, month) {
     wash(ctx, cx, cy, r * 0.8, r * 0.7, sp.autumn, month === 9 ? 0.35 : 0.55, rnd, 18);
     ctx.globalCompositeOperation = "source-over";
   }
+  ctx.restore();
 }

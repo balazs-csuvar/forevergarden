@@ -1,4 +1,4 @@
-import { PLANTS } from "./plants.js";
+import { BY_ID, RECOMMENDABLE } from "./plant-index.js";
 
 export const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 export const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -44,7 +44,7 @@ export function bloomCoverage(state, spotId) {
 }
 
 export function speciesFor(state, id) {
-  return state.species[id] || PLANTS.find((plant) => plant.id === id) || null;
+  return state.species[id] || BY_ID.get(id) || null;
 }
 
 export function fitsConditions(sp, area, settings) {
@@ -64,7 +64,7 @@ export function recommendFor(state, spot, area, { limit = 12, gapMonth = null, e
   const coverage = bloomCoverage(state, spot.id);
   const inGarden = new Set(state.placements.map((p) => p.speciesId));
   const evergreenCount = state.placements.filter((p) => p.spotId === spot.id && ["evergreen", "semi"].includes(speciesFor(state, p.speciesId)?.habit)).length;
-  const pool = [...PLANTS, ...Object.values(state.species).filter((sp) => sp.source === "claude-idea")];
+  const pool = [...RECOMMENDABLE, ...Object.values(state.species).filter((sp) => sp.source === "claude-idea")];
   const results = [];
   for (const sp of pool) {
     if (exclude.includes(sp.id)) continue;
