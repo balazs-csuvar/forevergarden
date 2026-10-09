@@ -14,14 +14,14 @@ export function newSpot(id, name, photoId, { light = "part", moist = "moist" } =
   };
 }
 
-export async function buildFirstGarden(photoBlob) {
+export async function buildFirstGarden(photoBlob, photoDate = null) {
   await putBlob("photo:spot-first", photoBlob);
   return {
     version: 2,
     settings: { gardenName: "My garden", region: "UK", hardiness: 4, soil: "unknown", aspect: "S", aspectConfirmed: false },
     startSpotId: "spot-first",
     species: {},
-    spots: [newSpot("spot-first", "My first view", "photo:spot-first")],
+    spots: [{ ...newSpot("spot-first", "My first view", "photo:spot-first"), photoDate }],
     placements: [],
     backdrop: {}
   };

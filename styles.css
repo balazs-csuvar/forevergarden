@@ -145,7 +145,15 @@ body.guiding .app, body.guiding .onboarding-panel:not(.guide-panel) { display: n
 .wx-stat span { font-size: 11px; color: var(--muted); }
 .wx-chart { position: relative; margin-top: 6px; }
 .wx-chart h3 { margin: 10px 0 4px; font-size: 12px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .8px; }
-.wx-chart svg { width: 100%; height: auto; display: block; overflow: visible; stroke: none; fill: none; }
+.wx-chart svg { display: block; overflow: visible; stroke: none; fill: none; max-width: none; }
+.wx-titles { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.wx-titles .muted { font-size: 11px; }
+.wx-frame { display: flex; }
+.wx-axis { flex: none; width: 26px; }
+.wx-axis svg { width: 26px; height: 92px; }
+.wx-scroll { overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; padding-bottom: 6px; touch-action: pan-x; }
+.wx-scroll svg { width: auto; height: 92px; }
+.wx-sub { margin: 10px 0 4px; height: 18px; position: sticky; left: 0; }
 .wx-chart text { font: 10px var(--sans); fill: var(--muted); }
 .wx-tip { position: absolute; pointer-events: none; background: var(--deep); color: #fff; font-size: 12px; padding: 6px 9px; border-radius: 8px; white-space: nowrap; transform: translate(-50%, -110%); z-index: 2; }
 .wx-table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 12px; }

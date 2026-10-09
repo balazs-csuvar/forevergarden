@@ -1,6 +1,6 @@
-// Watercolour engine. Pure pixel maths so it runs in a Web Worker (and in Node for tuning).
-// Input: RGBA pixels of a garden photo, the month (0-11), and plant "pins" that say whether a
-// region of the photo is evergreen (0), herbaceous (0.7) or deciduous (1) so seasons are local.
+// Sketch engine. Pure pixel maths so it runs in a Web Worker (and in Node for tuning).
+// Input: RGBA pixels of a garden photo, the target month and the photo's own month (0-11), and the
+// tagged plants with how much foliage each has lost / how autumnal it is, relative to the photo.
 
 const MONTH_GRADES = [
   { th: 38, a: 0.55, sm: 0.45, la: 0.05, cool: 0.06, bare: 1.0 },
@@ -82,48 +82,45 @@ function hslToRgb(h, s, l) {
   return [hueToRgb(p, q, hk + 1 / 3), hueToRgb(p, q, hk), hueToRgb(p, q, hk - 1 / 3)];
 }
 
-function buildDeciduousMap(w, h, pins) {
-  const map = new Float32Array(w * h).fill(0.55);
-  // Outlined plants: fill the traced shape exactly, then feather the edge.
-  let anyPoly = false;
+// Per-plant season maps from tagged plants. Each pin says how much of its photographed foliage is gone
+// (bare: leaf fall, dying back) and how far it has turned to its autumn colour, relative to the photo's date.
+function buildPlantMaps(w, h, pins) {
+  const N = w * h;
+  const bare = new Float32Array(N), aut = new Float32Array(N);
+  const aR = new Float32Array(N), aG = new Float32Array(N), aB = new Float32Array(N);
+  const stamp = (i, pin) => {
+    if (pin.bare > bare[i]) bare[i] = pin.bare;
+    if (pin.autumnAmt > aut[i]) { aut[i] = pin.autumnAmt; aR[i] = pin.autumn[0]; aG[i] = pin.autumn[1]; aB[i] = pin.autumn[2]; }
+  };
   for (const pin of pins) {
-    if (!pin.poly || pin.poly.length < 3) continue;
-    anyPoly = true;
-    let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
-    for (const [px, py] of pin.poly) { x0 = Math.min(x0, px); y0 = Math.min(y0, py); x1 = Math.max(x1, px); y1 = Math.max(y1, py); }
-    const poly = pin.poly.map(([px, py]) => [px * w, py * h]);
-    for (let y = Math.max(0, Math.floor(y0 * h)); y <= Math.min(h - 1, Math.ceil(y1 * h)); y += 1) {
-      // Scanline fill: find crossings for this row.
-      const xs = [];
-      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-        const [xi, yi] = poly[i], [xj, yj] = poly[j];
-        if ((yi > y) !== (yj > y)) xs.push(xi + ((y - yi) / (yj - yi)) * (xj - xi));
+    if (!(pin.bare > 0.02) && !(pin.autumnAmt > 0.02)) continue;
+    if (pin.poly && pin.poly.length >= 3) {
+      const poly = pin.poly.map(([px, py]) => [px * w, py * h]);
+      let y0 = h, y1 = 0;
+      for (const [, py] of poly) { y0 = Math.min(y0, py); y1 = Math.max(y1, py); }
+      for (let y = Math.max(0, Math.floor(y0)); y <= Math.min(h - 1, Math.ceil(y1)); y += 1) {
+        const xs = [];
+        for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+          const [xi, yi] = poly[i], [xj, yj] = poly[j];
+          if ((yi > y) !== (yj > y)) xs.push(xi + ((y - yi) / (yj - yi)) * (xj - xi));
+        }
+        xs.sort((a, b) => a - b);
+        for (let k = 0; k + 1 < xs.length; k += 2) for (let x = Math.max(0, Math.ceil(xs[k])); x <= Math.min(w - 1, Math.floor(xs[k + 1])); x += 1) stamp(y * w + x, pin);
       }
-      xs.sort((a, b) => a - b);
-      for (let k = 0; k + 1 < xs.length; k += 2) {
-        for (let x = Math.max(0, Math.ceil(xs[k])); x <= Math.min(w - 1, Math.floor(xs[k + 1])); x += 1) map[y * w + x] = pin.kind;
-      }
+    } else {
+      const cx = pin.x * w, cy = pin.y * h, rad = Math.max(4, pin.r * w);
+      for (let y = Math.max(0, Math.floor(cy - rad)); y <= Math.min(h - 1, Math.ceil(cy + rad)); y += 1)
+        for (let x = Math.max(0, Math.floor(cx - rad)); x <= Math.min(w - 1, Math.ceil(cx + rad)); x += 1)
+          if ((x - cx) ** 2 + (y - cy) ** 2 <= rad * rad) stamp(y * w + x, pin);
     }
   }
-  if (anyPoly) boxBlur(map, w, h, Math.max(2, Math.round(w / 220)), 2);
-  for (const pin of pins) {
-    if (pin.poly && pin.poly.length >= 3) continue;
-    const cx = pin.x * w, cy = pin.y * h, rad = Math.max(4, pin.r * w);
-    const x0 = Math.max(0, Math.floor(cx - rad * 1.6)), x1 = Math.min(w - 1, Math.ceil(cx + rad * 1.6));
-    const y0 = Math.max(0, Math.floor(cy - rad * 1.6)), y1 = Math.min(h - 1, Math.ceil(cy + rad * 1.6));
-    for (let y = y0; y <= y1; y += 1) {
-      for (let x = x0; x <= x1; x += 1) {
-        const d2 = ((x - cx) ** 2 + (y - cy) ** 2) / (rad * rad);
-        const wgt = Math.exp(-d2 * 1.4);
-        const i = y * w + x;
-        map[i] += (pin.kind - map[i]) * wgt;
-      }
-    }
-  }
-  return map;
+  const r = Math.max(2, Math.round(w / 260));
+  boxBlur(bare, w, h, r, 2);
+  boxBlur(aut, w, h, r, 2);
+  return { bare, aut, aR, aG, aB };
 }
 
-function seasonGrade(src, w, h, month, decid, nz) {
+function seasonGrade(src, w, h, month, decid, nz, strength = 1) {
   const g = MONTH_GRADES[month];
   const N = w * h;
   const R = new Float32Array(N), G = new Float32Array(N), B = new Float32Array(N);
@@ -137,22 +134,15 @@ function seasonGrade(src, w, h, month, decid, nz) {
         const d = decid[i];
         const patch = nz.fbm(x * 0.018, y * 0.018, 3);
         const target = g.th + (patch - 0.5) * 34;
-        const amt = Math.min(0.92, g.a * (0.2 + 1.15 * d) * veg * (0.55 + 0.9 * patch));
+        const amt = Math.min(0.92, g.a * (0.2 + 1.15 * d) * veg * (0.55 + 0.9 * patch)) * strength;
         let diff = ((target - hue + 540) % 360) - 180;
         hue += diff * amt;
-        sat *= 1 + (g.sm - 1) * veg * (0.35 + 0.9 * d);
-        const bare = g.bare * smoothstep(0.55, 0.9, d) * veg;
-        // Bare winter branches: a soft grey-brown-mauve haze instead of a green canopy.
-        if (bare > 0) {
-          hue += ((((20 - hue + 540) % 360) - 180)) * bare;
-          lum += (0.58 + 0.08 * patch - lum) * bare * 0.65;
-          sat *= 1 - bare * 0.7;
-        }
+        sat *= 1 + (g.sm - 1) * veg * (0.35 + 0.9 * d) * strength;
         [r, gg, b] = hslToRgb(hue, Math.min(1, sat), Math.min(1, lum));
       }
-      r += g.la || 0; gg += g.la || 0; b += g.la || 0;
-      if (g.cool) { b += g.cool; r -= g.cool * 0.5; }
-      if (g.warm) { r += g.warm; b -= g.warm * 0.6; }
+      r += (g.la || 0) * strength; gg += (g.la || 0) * strength; b += (g.la || 0) * strength;
+      if (g.cool) { b += g.cool * strength; r -= g.cool * 0.5 * strength; }
+      if (g.warm) { r += g.warm * strength; b -= g.warm * 0.6 * strength; }
       R[i] = r; G[i] = gg; B[i] = b;
     }
   }
@@ -303,7 +293,7 @@ function contourLines(A, w, h, share) {
 }
 
 // Share of the picture drawn in ink: outlines of masses, and finer detail lines.
-const INK_SHARE = { mass: 0.045, detail: 0.03 };
+const INK_SHARE = { mass: 0.045, detail: 0.05 };
 
 // Stretch exposure so a dim or bright photo maps to the same tonal range before drawing.
 function normalizeExposure(src, w, h) {
@@ -322,13 +312,25 @@ function normalizeExposure(src, w, h) {
 }
 
 // Garden-designer sketch: ink linework + hatching carry the detail, a loose watercolour tint carries colour.
-function paint(src, w, h, month, pins, seed) {
+function paint(src, w, h, month, pins, seed, photoMonth = 7) {
   const N = w * h;
   const k = w / 900;
   const nz = makeNoise(seed || 7);
   const rnd = mulberry32((seed || 7) * 31 + 5);
-  const decid = buildDeciduousMap(w, h, pins || []);
-  const [R, G, B] = seasonGrade(normalizeExposure(src, w, h), w, h, month, decid, nz);
+  const maps = buildPlantMaps(w, h, pins || []);
+  // Untagged areas: only a gentle seasonal shift, and none at all near the month the photo was taken.
+  const gap = Math.min((month - photoMonth + 12) % 12, (photoMonth - month + 12) % 12);
+  const norm = normalizeExposure(src, w, h);
+  const [R, G, B] = seasonGrade(norm, w, h, month, new Float32Array(w * h).fill(gap >= 2 ? 0.15 : 0), nz, gap >= 2 ? 0.45 : 0);
+  // Tagged deciduous plants turn their own autumn colour, keeping the photo's light and shade.
+  for (let i = 0; i < w * h; i += 1) {
+    const a = maps.aut[i];
+    if (a < 0.02) continue;
+    const lum = 0.3 * R[i] + 0.59 * G[i] + 0.11 * B[i];
+    const al = 0.3 * maps.aR[i] + 0.59 * maps.aG[i] + 0.11 * maps.aB[i] || 0.5;
+    const kk = Math.min(1.6, lum / al);
+    R[i] += (maps.aR[i] * kk - R[i]) * a; G[i] += (maps.aG[i] * kk - G[i]) * a; B[i] += (maps.aB[i] * kk - B[i]) * a;
+  }
 
   // Edge-preserving clean-up so lines follow real edges, not photo noise.
   // Two levels: light clean-up for hard landscaping, heavier simplification so foliage reads as masses.
@@ -336,11 +338,11 @@ function paint(src, w, h, month, pins, seed) {
   const L = new Float32Array(N);
   for (let i = 0; i < N; i += 1) L[i] = Math.min(1, Math.max(0, 0.3 * kR[i] + 0.59 * kG[i] + 0.11 * kB[i]));
   // A round blur (not a square filter) so foliage masses get soft, cloud-like outlines.
-  const M = gaussian(L, w, h, 2.6 * k);
+  const M = gaussian(L, w, h, 2.2 * k);
 
   // Ink lines: thin contours of the simplified masses, plus finer detail on the lightly cleaned image.
   const massLines = contourLines(M, w, h, INK_SHARE.mass);
-  const detailLines = contourLines(gaussian(L, w, h, 0.9 * k), w, h, INK_SHARE.detail);
+  const detailLines = contourLines(gaussian(L, w, h, 0.7 * k), w, h, INK_SHARE.detail);
   const T = gaussian(L, w, h, 2.5 * k);
 
   // Soft, misregistered colour for the tint.
@@ -393,6 +395,9 @@ function paint(src, w, h, month, pins, seed) {
       m *= smoothstep(0.2, 0.45, patch + 0.12);
       m *= 1 - smoothstep(0.75, 0.92, t) * 0.8;
       m *= colourMask;
+      // Leaf fall: a tagged plant's lost foliage goes back to paper (the drawing adds bare branches).
+      const gone = maps.bare[i];
+      m *= 1 - gone;
       const rim = (1 - Math.abs(2 * m - 1)) * 0.08 * colourMask;
       const gran = 1 + (rnd() - 0.5) * 0.05 + (nz.fbm(x * 0.25, y * 0.25, 2) - 0.5) * 0.08 * m;
 
@@ -403,7 +408,7 @@ function paint(src, w, h, month, pins, seed) {
 
       // Ink pressure varies a little, like a fineliner.
       const pressure = 0.75 + 0.35 * nz.noise(x * 0.03 / k + 3, y * 0.03 / k);
-      const a = Math.min(0.95, (lineInk * 0.95 + hatch * 0.5) * pressure) * inkMask;
+      const a = Math.min(0.95, (lineInk * 0.95 * (1 - gone * 0.92) + hatch * 0.5 * (1 - gone)) * pressure) * inkMask;
       fr = fr * (1 - a) + inkC[0] * a;
       fg = fg * (1 - a) + inkC[1] * a;
       fb = fb * (1 - a) + inkC[2] * a;
@@ -418,9 +423,9 @@ function paint(src, w, h, month, pins, seed) {
 
 if (typeof self !== "undefined" && typeof self.postMessage === "function" && typeof module === "undefined") {
   self.onmessage = (event) => {
-    const { id, width, height, data, month, pins, seed } = event.data;
+    const { id, width, height, data, month, pins, seed, photoMonth } = event.data;
     try {
-      const out = paint(new Uint8ClampedArray(data), width, height, month, pins, seed);
+      const out = paint(new Uint8ClampedArray(data), width, height, month, pins, seed, photoMonth);
       self.postMessage({ id, data: out.buffer }, [out.buffer]);
     } catch (error) {
       self.postMessage({ id, error: String(error && error.message || error) });

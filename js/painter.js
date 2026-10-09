@@ -339,31 +339,148 @@ export function paintPlant(ctx, W, H, placement, sp, month, spot) {
 }
 
 // For plants already in the photo: dab flowers / autumn tints over their region in season.
-export function paintExistingSeason(ctx, W, H, placement, sp, month) {
-  const rnd = seededRandom(placement.id + month);
-  const st = plantState(sp, month);
-  let cx = placement.x * W, cy = placement.y * H, r = placement.r * W;
-  // Outlined plants: keep the season's flowers and tints inside the traced shape.
-  ctx.save();
+// How a tagged plant differs between the month its photo was taken and the month being shown.
+// bare: share of the photographed foliage that has fallen / died back. leafAdd: foliage to draw that the
+// photo doesn't show (e.g. a winter photo viewed in summer). autumnAmt: how far leaves have turned.
+export function seasonDelta(sp, month, photoMonth) {
+  const t = plantState(sp, month), p = plantState(sp, photoMonth);
+  const losesLeaves = sp.habit !== "evergreen";
+  const bare = losesLeaves && p.leaf > 0.05 ? Math.max(0, Math.min(1, (p.leaf - t.leaf) / p.leaf)) : 0;
+  const leafAdd = losesLeaves ? Math.max(0, t.leaf - p.leaf) : 0;
+  const autumnal = (m) => (sp.habit === "deciduous" || sp.habit === "semi" ? (m === 9 ? 0.55 : m === 10 ? 0.9 : 0) : sp.habit === "herbaceous" ? (m === 9 ? 0.35 : m === 10 ? 0.7 : 0) : 0);
+  const autumnAmt = Math.max(0, autumnal(month) - autumnal(photoMonth)) * (1 - bare);
+  const autumnColour = sp.autumn || (sp.habit === "herbaceous" ? "#a8875a" : "#c9952f");
+  return { bare, leafAdd, autumnAmt, autumnColour, t, p };
+}
+
+function outlineBounds(placement, W, H) {
   if (placement.outline?.length > 2) {
-    ctx.beginPath();
-    placement.outline.forEach(([px, py], i) => (i ? ctx.lineTo(px * W, py * H) : ctx.moveTo(px * W, py * H)));
-    ctx.closePath();
-    ctx.clip();
     let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
     for (const [px, py] of placement.outline) { x0 = Math.min(x0, px); y0 = Math.min(y0, py); x1 = Math.max(x1, px); y1 = Math.max(y1, py); }
-    cx = ((x0 + x1) / 2) * W; cy = ((y0 + y1) / 2) * H; r = Math.max((x1 - x0) * W, (y1 - y0) * H) * 0.62;
+    return { x0: x0 * W, y0: y0 * H, x1: x1 * W, y1: y1 * H };
   }
-  if (sp.flower && st.flowering > 0 && sp.form !== "tree") {
-    dabs(ctx, cx, cy, r * 0.7, r * 0.55, sp.flower, Math.round((14 + r * 0.25) * st.flowering), Math.max(1.5, r * 0.05), rnd);
-  } else if (sp.flower && st.flowering > 0) {
-    dabs(ctx, cx, cy, r * 0.75, r * 0.6, sp.flower, Math.round((20 + r * 0.3) * st.flowering), Math.max(1.5, r * 0.035), rnd);
+  const r = (placement.r || 0.05) * W;
+  return { x0: placement.x * W - r, y0: placement.y * H - r, x1: placement.x * W + r, y1: placement.y * H + r };
+}
+
+function clipToOutline(ctx, placement, W, H, grow = 1) {
+  const b = outlineBounds(placement, W, H);
+  const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
+  ctx.beginPath();
+  if (placement.outline?.length > 2) {
+    placement.outline.forEach(([px, py], i) => {
+      const x = cx + (px * W - cx) * grow, y = cy + (py * H - cy) * grow;
+      if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+    });
+  } else ctx.ellipse(cx, cy, ((b.x1 - b.x0) / 2) * grow, ((b.y1 - b.y0) / 2) * grow, 0, 0, Math.PI * 2);
+  ctx.closePath();
+  ctx.clip();
+}
+
+// A winter tree drawn in ink: trunk, then branches that fork and taper up into the old canopy.
+function treeSkeleton(ctx, b, rnd, alpha, colour) {
+  const w = b.x1 - b.x0, h = b.y1 - b.y0;
+  const baseX = (b.x0 + b.x1) / 2 + (rnd() - 0.5) * w * 0.06, baseY = b.y1;
+  const branch = (x, y, angle, len, width, depth) => {
+    const ex = x + Math.cos(angle) * len, ey = y + Math.sin(angle) * len;
+    const mx = (x + ex) / 2 + (rnd() - 0.5) * len * 0.25, my = (y + ey) / 2 + (rnd() - 0.5) * len * 0.15;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.quadraticCurveTo(mx, my, ex, ey);
+    ctx.lineWidth = Math.max(0.5, width);
+    ctx.strokeStyle = colour ? colour : INK(alpha * (0.55 + 0.45 * Math.min(1, width / 2)));
+    ctx.stroke();
+    if (depth <= 0 || len < 3) return;
+    const forks = depth > 3 ? 2 : 2 + (rnd() < 0.5 ? 1 : 0);
+    for (let k = 0; k < forks; k += 1) {
+      const spread = 0.35 + rnd() * 0.35;
+      const a = angle + (k - (forks - 1) / 2) * spread * 1.2 + (rnd() - 0.5) * 0.3;
+      branch(ex, ey, a, len * (0.66 + rnd() * 0.14), width * 0.68, depth - 1);
+    }
+  };
+  ctx.lineCap = "round";
+  const trunkLen = h * 0.3;
+  const stems = w > h * 1.2 ? 2 : 1;
+  for (let sIdx = 0; sIdx < stems; sIdx += 1) {
+    const a0 = -Math.PI / 2 + (stems > 1 ? (sIdx - 0.5) * 0.35 : (rnd() - 0.5) * 0.1);
+    branch(baseX, baseY, a0, trunkLen, Math.max(1.6, w * 0.035), 6);
   }
-  if (st.fruit) dabs(ctx, cx, cy, r * 0.6, r * 0.5, st.fruit, 18, Math.max(1.2, r * 0.03), rnd);
-  if (sp.autumn && (month === 9 || month === 10)) {
-    ctx.globalCompositeOperation = "soft-light";
-    wash(ctx, cx, cy, r * 0.8, r * 0.7, sp.autumn, month === 9 ? 0.35 : 0.55, rnd, 18);
-    ctx.globalCompositeOperation = "source-over";
+}
+
+// A winter shrub: many stems from the ground, a few side twigs.
+function shrubStems(ctx, b, rnd, alpha, colour) {
+  const w = b.x1 - b.x0, h = b.y1 - b.y0;
+  const baseX = (b.x0 + b.x1) / 2, baseY = b.y1;
+  const stems = Math.round(10 + Math.min(14, w / 12));
+  ctx.lineCap = "round";
+  for (let i = 0; i < stems; i += 1) {
+    const t = i / (stems - 1) - 0.5;
+    const ex = baseX + t * w * (0.8 + rnd() * 0.2), ey = b.y0 + h * (0.05 + rnd() * 0.3) + Math.abs(t) * h * 0.35;
+    const sx = baseX + t * w * 0.15;
+    ctx.beginPath();
+    ctx.moveTo(sx, baseY);
+    ctx.quadraticCurveTo(sx + (ex - sx) * 0.3, baseY - h * 0.45, ex, ey);
+    ctx.lineWidth = Math.max(0.6, w * 0.006);
+    ctx.strokeStyle = colour || INK(alpha * 0.8);
+    ctx.stroke();
+    for (let j = 0; j < 3; j += 1) {
+      const u = 0.45 + rnd() * 0.45;
+      const px = sx + (ex - sx) * u, py = baseY + (ey - baseY) * u;
+      ctx.beginPath();
+      ctx.moveTo(px, py);
+      ctx.lineTo(px + (rnd() - 0.5) * w * 0.12, py - h * (0.05 + rnd() * 0.08));
+      ctx.lineWidth = Math.max(0.5, w * 0.003);
+      ctx.strokeStyle = colour || INK(alpha * 0.6);
+      ctx.stroke();
+    }
   }
+}
+
+// Perennials that have died back: a low tuft of brown stubs at the base.
+function deadTuft(ctx, b, rnd, alpha) {
+  const w = b.x1 - b.x0, h = b.y1 - b.y0;
+  const baseY = b.y1, cx = (b.x0 + b.x1) / 2;
+  const tuftH = Math.min(h * 0.22, w * 0.25);
+  ctx.lineCap = "round";
+  for (let i = 0; i < 18; i += 1) {
+    const x = cx + (rnd() - 0.5) * w * 0.7;
+    ctx.beginPath();
+    ctx.moveTo(x, baseY);
+    ctx.lineTo(x + (rnd() - 0.5) * tuftH * 0.6, baseY - tuftH * (0.4 + rnd() * 0.6));
+    ctx.lineWidth = Math.max(0.6, LW * 0.7);
+    ctx.strokeStyle = rnd() < 0.5 ? INK(alpha * 0.6) : `rgba(140,112,78,${alpha * 0.8})`;
+    ctx.stroke();
+  }
+}
+
+// Season overlay for plants that are in the photo: bare branches, die-back, new leaves, flowers, fruit.
+export function paintExistingSeason(ctx, W, H, placement, sp, month, photoMonth = month) {
+  const rnd = seededRandom(placement.id + month);
+  LW = Math.max(0.8, Math.min(W, H) / 520);
+  const d = seasonDelta(sp, month, photoMonth);
+  const b = outlineBounds(placement, W, H);
+  const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
+  const rx = (b.x1 - b.x0) / 2, ry = (b.y1 - b.y0) / 2;
+  const woody = ["tree", "column", "mound", "upright", "ball", "climber"].includes(sp.form) && sp.habit !== "herbaceous" && sp.habit !== "bulb";
+
+  if (d.bare > 0.25) {
+    ctx.save();
+    clipToOutline(ctx, placement, W, H, 1.06);
+    if (woody && (sp.form === "tree" || sp.h > 3.5)) treeSkeleton(ctx, b, rnd, d.bare, d.t.stems && sp.stems ? sp.stems : null);
+    else if (woody) shrubStems(ctx, b, rnd, d.bare, sp.stems && d.t.stems ? sp.stems : null);
+    else if (sp.habit === "herbaceous") deadTuft(ctx, b, rnd, d.bare);
+    ctx.restore();
+  }
+
+  ctx.save();
+  clipToOutline(ctx, placement, W, H);
+  if (d.leafAdd > 0.25) canopy(ctx, cx, cy + ry * 0.05, rx * 0.95, ry * 0.95, d.t.foliage, rnd, d.leafAdd);
+  // Flowers and fruit only when the photo doesn't already show them.
+  const fl = sp.flower && d.t.flowering > d.p.flowering ? d.t.flowering - d.p.flowering : 0;
+  if (fl > 0) {
+    const r = Math.max(rx, ry);
+    dabs(ctx, cx, cy, rx * 0.8, ry * 0.75, sp.flower, Math.round((16 + r * 0.25) * fl), Math.max(1.5, Math.min(r * 0.045, W * 0.01)), rnd);
+  }
+  if (d.t.fruit && !d.p.fruit) dabs(ctx, cx, cy, rx * 0.7, ry * 0.65, d.t.fruit, 18, Math.max(1.2, Math.min(rx, ry) * 0.03), rnd);
   ctx.restore();
 }

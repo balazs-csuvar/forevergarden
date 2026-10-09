@@ -2,14 +2,15 @@ import { getValue, setValue, getBlob, putBlob, deleteBlobsWithPrefix, uid } from
 import { searchPlants, SOURCE_LABEL } from "./plant-index.js";
 import { segmentAt, pointInPoly, polyBounds } from "./segment.js";
 import { buildFirstGarden, newSpot } from "./seed.js";
-import { paintPlant, paintExistingSeason, plantState } from "./painter.js";
+import { paintPlant, paintExistingSeason, plantState, seasonDelta } from "./painter.js";
+import { photoTakenOn } from "./exif.js";
 import { MONTHS, MON, monthRange, nearestArea, bloomCoverage, speciesFor, recommendFor, describeConditions, fitsConditions } from "./recommend.js";
 import * as ai from "./ai.js";
 import { loadWeather, syncWeather, findPlace, monthSummary, lastDays, isoDay } from "./weather.js";
 import { GUIDE_STEPS, GUIDE_LINKS, GUIDE_AREAS, guideDiagram } from "./guided.js";
 
-const ENGINE = "sk4";
-const WORK_SIZE = 960;
+const ENGINE = "sk5";
+const WORK_SIZE = 1200;
 const SEASON_COLORS = ["#a7b6c8", "#b3c0c9", "#c3d39a", "#a6cf7a", "#8cc46a", "#e2a6bd", "#e6c25a", "#dba94a", "#c99a4a", "#c9773e", "#a86a48", "#9aa8b8"];
 const LIGHT_LABEL = { full: "Full sun (6h+)", part: "Part shade (3–6h)", shade: "Shade (<3h)" };
 const MOIST_LABEL = { dry: "Dry", moist: "Moist, drains well", wet: "Damp / heavy" };
@@ -58,7 +59,7 @@ function openSheet(html, bind) {
 function closeSheet() {
   if (sheet.open) sheet.close();
   sheet.classList.remove("compact");
-  if (ui.draft && ui.mode?.type !== "draw") { ui.draft = null; if (ui.view === "walk") renderOverlay(); }
+  if (ui.draft && ui.mode?.type !== "draw") { ui.draft = null; endTagPhoto(); if (ui.view === "walk") renderOverlay(); }
   ui.sheetPlacement = null;
   document.querySelectorAll(".pin.selected").forEach((pin) => pin.classList.remove("selected"));
 }
@@ -105,12 +106,12 @@ worker.onmessage = (event) => {
   if (event.data.error) job.reject(new Error(event.data.error));
   else job.resolve(event.data.data);
 };
-function paintInWorker(imageData, month, pins) {
+function paintInWorker(imageData, month, pins, photoMonth) {
   return new Promise((resolve, reject) => {
     const id = nextJob++;
     jobs.set(id, { resolve, reject });
     const copy = imageData.data.slice().buffer;
-    worker.postMessage({ id, width: imageData.width, height: imageData.height, data: copy, month, pins, seed: 7 }, [copy]);
+    worker.postMessage({ id, width: imageData.width, height: imageData.height, data: copy, month, pins, photoMonth, seed: 7 }, [copy]);
   });
 }
 
@@ -139,10 +140,33 @@ async function pump() {
   pump();
 }
 
+// A view can have several photos over time; each month is drawn from the photo closest in season.
+function spotPhotos(spot) {
+  return [{ photoId: spot.photoId, date: spot.photoDate || null }, ...(spot.history || [])].filter((ph) => ph.photoId);
+}
+const photoMonthOf = (ph) => (ph?.date ? Number(ph.date.slice(5, 7)) - 1 : 7);
+function bestPhoto(spot, month) {
+  let best = null, bestD = 99;
+  for (const ph of spotPhotos(spot)) {
+    const pm = photoMonthOf(ph);
+    const d = Math.min((month - pm + 12) % 12, (pm - month + 12) % 12);
+    if (d < bestD || (d === bestD && (ph.date || "") > (best.date || ""))) { best = ph; bestD = d; }
+  }
+  return best || { photoId: spot.photoId, date: spot.photoDate || null };
+}
+// After dates change, the newest photo becomes the view's main photo.
+function sortSpotPhotos(spot) {
+  const all = spotPhotos(spot).sort((a, b) => (a.date || "0000").localeCompare(b.date || "0000"));
+  const current = all.pop();
+  spot.photoId = current.photoId;
+  spot.photoDate = current.date;
+  spot.history = all;
+}
+
 const pixelCache = new Map();
-async function spotPixels(spot) {
-  if (pixelCache.has(spot.id)) return pixelCache.get(spot.id);
-  const blob = await getBlob(spot.photoId);
+async function spotPixels(spot, photoId = bestPhoto(spot, ui.month).photoId) {
+  if (pixelCache.has(photoId)) return pixelCache.get(photoId);
+  const blob = await getBlob(photoId);
   if (!blob) throw new Error("Photo missing for this view");
   const bitmap = await createImageBitmap(blob, { imageOrientation: "from-image" });
   const scale = Math.min(1, WORK_SIZE / Math.max(bitmap.width, bitmap.height));
@@ -153,26 +177,32 @@ async function spotPixels(spot) {
   ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
   const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
   if (pixelCache.size > 3) pixelCache.delete(pixelCache.keys().next().value);
-  pixelCache.set(spot.id, data);
+  pixelCache.set(photoId, data);
   return data;
 }
 
-function habitKind(sp) {
-  if (!sp) return 0.55;
-  return { evergreen: 0, semi: 0.3, herbaceous: 0.75, bulb: 0.75, deciduous: 1 }[sp.habit] ?? 0.55;
-}
-function pinsFor(spot) {
-  const pins = state.placements
+const hexToUnit = (hex) => { const v = parseInt(String(hex || "#c9952f").slice(1, 7), 16); return [((v >> 16) & 255) / 255, ((v >> 8) & 255) / 255, (v & 255) / 255]; };
+// Tagged plants and how each differs from the photo in the month shown (leaf fall, autumn colour).
+function pinsFor(spot, month, photoMonth) {
+  return state.placements
     .filter((p) => p.spotId === spot.id && p.status === "existing")
-    .map((p) => ({ x: p.x, y: p.y, r: p.r || 0.06, kind: habitKind(speciesFor(state, p.speciesId)), poly: p.outline || null }));
-  return pins.concat(state.backdrop?.[spot.id] || []);
+    .map((p) => {
+      const sp = speciesFor(state, p.speciesId);
+      if (!sp) return null;
+      const d = seasonDelta(sp, month, photoMonth);
+      return { x: p.x, y: p.y, r: p.r || 0.06, poly: p.outline || null, bare: +d.bare.toFixed(2), autumnAmt: +d.autumnAmt.toFixed(2), autumn: hexToUnit(d.autumnColour) };
+    })
+    .filter(Boolean);
 }
 function hashStr(text) {
   let h = 0;
   for (let i = 0; i < text.length; i += 1) h = (Math.imul(31, h) + text.charCodeAt(i)) | 0;
   return (h >>> 0).toString(36);
 }
-const baseKey = (spot, month) => `wc:${spot.id}:${month}:${hashStr(JSON.stringify(pinsFor(spot)))}:${ENGINE}`;
+const baseKey = (spot, month) => {
+  const ph = bestPhoto(spot, month);
+  return `wc:${spot.id}:${ph.photoId}:${photoMonthOf(ph)}:${month}:${hashStr(JSON.stringify(pinsFor(spot, month, photoMonthOf(ph))))}:${ENGINE}`;
+};
 
 const baseCache = new Map();
 const inflight = new Map();
@@ -188,8 +218,9 @@ async function getBase(spot, month, priority = 1) {
     const stored = await getBlob(key).catch(() => null);
     if (stored) return createImageBitmap(stored);
     return schedule(key, async () => {
-      const px = await spotPixels(spot);
-      const buffer = await paintInWorker(px, month, pinsFor(spot));
+      const ph = bestPhoto(spot, month);
+      const px = await spotPixels(spot, ph.photoId);
+      const buffer = await paintInWorker(px, month, pinsFor(spot, month, photoMonthOf(ph)), photoMonthOf(ph));
       const canvas = document.createElement("canvas");
       canvas.width = px.width;
       canvas.height = px.height;
@@ -213,7 +244,7 @@ function drawPlants(ctx, W, H, spot, month, { highlight } = {}) {
   const here = state.placements.filter((p) => p.spotId === spot.id);
   for (const p of here.filter((p) => p.status === "existing")) {
     const sp = speciesFor(state, p.speciesId);
-    if (sp) paintExistingSeason(ctx, W, H, p, sp, month);
+    if (sp) paintExistingSeason(ctx, W, H, p, sp, month, photoMonthOf(bestPhoto(spot, month)));
   }
   for (const p of here.filter((p) => p.status === "planned").sort((a, b) => a.y - b.y)) {
     const sp = speciesFor(state, p.speciesId);
@@ -342,7 +373,9 @@ function renderWalkHeader() {
   const planned = here.filter((p) => p.status === "planned").length;
   const yday = weatherLog.days[isoDay(new Date(Date.now() - 864e5))];
   const wx = yday && ui.month === new Date().getMonth() ? ` · yesterday ${Math.round(yday.tmin)}–${Math.round(yday.tmax)}°C, ${yday.rain} mm` : "";
-  $("#spot-sub").textContent = `${MONTHS[ui.month]} · ${blooming ? `${blooming} in flower` : "nothing in flower"}${planned ? ` · ${planned} planned` : ""}${wx}`;
+  const ph = bestPhoto(spot, ui.month);
+  const photoNote = ui.photo ? ` · photo ${ph.date ? fmtDate(ph.date) : "(date not set)"}` : ph.date && photoMonthOf(ph) !== ui.month ? ` · from ${MON[photoMonthOf(ph)]} photo` : "";
+  $("#spot-sub").textContent = `${MONTHS[ui.month]} · ${blooming ? `${blooming} in flower` : "nothing in flower"}${planned ? ` · ${planned} planned` : ""}${photoNote}${wx}`;
   $("#back-btn").hidden = !ui.history.length;
   $("#edit-toggle").setAttribute("aria-pressed", String(ui.edit));
   $("#stage").classList.toggle("edit", ui.edit);
@@ -415,7 +448,6 @@ function renderOverlay() {
   const spot = currentSpot();
   const overlay = $("#overlay");
   overlay.classList.toggle("no-labels", !ui.labels);
-  if (ui.photo) { overlay.innerHTML = ""; return; }
   const nums = numbering(spot.id);
   const pins = state.placements.filter((p) => p.spotId === spot.id).map((p) => {
     const sp = speciesFor(state, p.speciesId);
@@ -424,7 +456,7 @@ function renderOverlay() {
     const y = p.status === "planned" ? p.y - 0.015 : p.y;
     return `<button class="${cls}" data-pin="${p.id}" style="left:${p.x * 100}%;top:${y * 100}%" aria-label="${esc(sp.name)}"><span class="dot">${nums.get(p.id)}</span><span class="tag">${esc(shortName(sp))}</span></button>`;
   });
-  const links = (spot.links || []).map((link) => `<button class="hotspot${link.to ? "" : " empty"}" data-link="${link.id}" style="left:${link.x * 100}%;top:${link.y * 100}%" aria-label="${esc(link.to ? `Walk to ${link.label}` : `${link.label}: no photo yet`)}"><span class="ring"><svg viewBox="0 0 24 24">${link.to ? '<path d="m6 15 6-6 6 6"/><path d="m6 20 6-6 6 6" opacity=".45"/>' : '<path d="M12 6v12M6 12h12"/>'}</svg></span><span class="label">${esc(link.label)}</span></button>`);
+  const links = (ui.photo ? [] : spot.links || []).map((link) => `<button class="hotspot${link.to ? "" : " empty"}" data-link="${link.id}" style="left:${link.x * 100}%;top:${link.y * 100}%" aria-label="${esc(link.to ? `Walk to ${link.label}` : `${link.label}: no photo yet`)}"><span class="ring"><svg viewBox="0 0 24 24">${link.to ? '<path d="m6 15 6-6 6 6"/><path d="m6 20 6-6 6 6" opacity=".45"/>' : '<path d="M12 6v12M6 12h12"/>'}</svg></span><span class="label">${esc(link.label)}</span></button>`);
   const outlines = state.placements.filter((p) => p.spotId === spot.id && p.outline?.length > 2).map((p) =>
     `<polygon class="${p.confirmed ? "" : "unconfirmed"}${ui.sheetPlacement === p.id ? " selected" : ""}" points="${p.outline.map(([x, y]) => `${(x * 1000).toFixed(1)},${(y * 1000).toFixed(1)}`).join(" ")}" />`);
   const draft = ui.draft?.seg?.poly ? `<polygon class="draft" points="${ui.draft.seg.poly.map(([x, y]) => `${(x * 1000).toFixed(1)},${(y * 1000).toFixed(1)}`).join(" ")}" />` : "";
@@ -531,6 +563,7 @@ function handleStageTap(event) {
 /* ---------- tap a plant: outline it, then tag it ---------- */
 async function outlineAt(x, y, looseness = 1) {
   const spot = currentSpot();
+  if (!ui.photo) { ui.photo = true; ui.photoForTag = true; await renderWalk(); }
   try {
     const px = await spotPixels(spot);
     const seg = segmentAt(px, x, y, looseness);
@@ -571,16 +604,26 @@ function finishDrawing(points) {
 
 function discardDraft() {
   ui.draft = null;
+  endTagPhoto();
   renderOverlay();
+}
+// Back to the sketch once tagging is finished (only if tagging switched to the photo).
+function endTagPhoto() {
+  if (!ui.photoForTag) return;
+  ui.photoForTag = false;
+  ui.photo = false;
+  if (ui.view === "walk") renderWalk();
 }
 
 function tagDraftAs(speciesId, confirmed = true) {
   const d = ui.draft;
   if (!d) return;
   const p = { id: uid("pl"), spotId: d.spotId, speciesId, status: "existing", x: d.seg.cx, y: d.seg.cy, r: d.seg.r, outline: d.seg.poly, confirmed, photos: [] };
-  if (d.photoKey) p.photos.push({ id: d.photoKey, date: new Date().toISOString().slice(0, 10) });
+  if (d.photoKey) p.photos.push({ id: d.photoKey, date: d.photoDate || isoDay(new Date()) });
   state.placements.push(p);
   ui.draft = null;
+  ui.photoForTag = false;
+  ui.photo = false;
   save();
   renderWalk();
   openPlacementSheet(p.id);
@@ -851,30 +894,35 @@ async function fillInDetails(p) {
 function openHereSheet(x, y) {
   const spot = currentSpot();
   const area = nearestArea(spot, x, y);
-  const recs = area ? recommendFor(state, spot, area, { limit: 10 }) : [];
   openSheet(`
     <p class="eyebrow">${esc(area ? area.name : "This spot")}</p>
-    <h2>What's here?</h2>
-    ${area ? `<p class="muted">${esc(describeConditions(area, state.settings))}</p>` : ""}
-    <div class="sheet-section"><h3>Plan something new here</h3>
-      ${recs.length ? `<div class="swap-strip">${recs.map(({ sp }) => `<button class="swap-card" data-place="${esc(sp.id)}"><canvas data-thumb="${esc(sp.id)}"></canvas><strong>${esc(sp.name)}</strong><small>${esc(sp.bloom.length ? monthRange(sp.bloom) : sp.habit)} · ${sp.h}m</small></button>`).join("")}</div>` : `<p class="muted">Set this area's light and moisture in Plan to see ideas.</p>`}
-      <button class="btn small" data-here="any">Choose any plant…</button>
-    </div>
+    <h2>What would you like to do here?</h2>
     <div class="choice-list">
-      <button class="choice" data-here="existing"><svg viewBox="0 0 24 24"><path d="M12 21v-8m0 3c-4.5 0-7-2.5-7-7.5 4.5 0 7 2.5 7 7.5Zm0-3c0-4.5 2.5-7 7-7 0 4.5-2.5 7-7 7Z"/></svg><span><strong>Tag a plant that's already here</strong><small>Identify it from a photo or pick it from the list</small></span></button>
+      <button class="choice" data-here="existing"><svg viewBox="0 0 24 24"><path d="M12 21v-8m0 3c-4.5 0-7-2.5-7-7.5 4.5 0 7 2.5 7 7.5Zm0-3c0-4.5 2.5-7 7-7 0 4.5-2.5 7-7 7Z"/></svg><span><strong>Tag a plant that's here</strong><small>Outline it on the photo and say what it is</small></span></button>
+      <button class="choice" data-here="plan"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg><span><strong>Plan something new here</strong><small>Ideas to plant, matched to this spot's conditions</small></span></button>
       <button class="choice" data-here="link"><svg viewBox="0 0 24 24"><path d="M5 19 19 5m0 0h-8m8 0v8"/></svg><span><strong>Make a path to another view from here</strong><small>Walk on to a close-up of this corner</small></span></button>
-      <button class="choice" data-here="area"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg><span><strong>${area ? "Adjust this area's conditions" : "Mark an area here"}</strong><small>Light, moisture and space shape every recommendation</small></span></button>
+      <button class="choice" data-here="area"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg><span><strong>${area ? "Adjust this area's conditions" : "Mark an area here"}</strong><small>Light, moisture and space shape the planting ideas</small></span></button>
     </div>`, (body) => {
-    body.querySelectorAll("canvas[data-thumb]").forEach((canvas) => { const s = speciesFor(state, canvas.dataset.thumb); if (s) paintThumb(canvas, s, showcaseMonth(s)); });
-    body.querySelectorAll("[data-place]").forEach((btn) => btn.addEventListener("click", () => { ui.mode = { type: "place", speciesId: btn.dataset.place, status: "planned" }; closeSheet(); placeAt(x, y); }));
-    body.querySelector('[data-here="any"]').addEventListener("click", () => pickSpecies({ title: "Plan which plant?", onPick: (id) => { ui.mode = { type: "place", speciesId: id, status: "planned" }; closeSheet(); placeAt(x, y); } }));
-    body.querySelector('[data-here="existing"]').addEventListener("click", () => pickSpecies({
-      title: "What's growing here?",
-      identify: true,
-      onPick: (id) => { ui.mode = { type: "place", speciesId: id, status: "existing" }; closeSheet(); placeAt(x, y); }
-    }));
+    body.querySelector('[data-here="existing"]').addEventListener("click", () => { closeSheet(); outlineAt(x, y); });
+    body.querySelector('[data-here="plan"]').addEventListener("click", () => openIdeasSheet(x, y));
     body.querySelector('[data-here="link"]').addEventListener("click", () => openLinkTargetSheet(x, y));
     body.querySelector('[data-here="area"]').addEventListener("click", () => openAreaSheet(area, x, y));
+  });
+}
+
+function openIdeasSheet(x, y) {
+  const spot = currentSpot();
+  const area = nearestArea(spot, x, y);
+  const recs = area ? recommendFor(state, spot, area, { limit: 10 }) : [];
+  openSheet(`
+    <p class="eyebrow">Ideas to plant · ${esc(area ? area.name : "this spot")}</p>
+    <h2>Plan something new</h2>
+    ${area ? `<p class="muted">Suggestions for ${esc(describeConditions(area, state.settings))}. None of these are in your garden yet.</p>` : ""}
+    ${recs.length ? `<div class="swap-strip">${recs.map(({ sp }) => `<button class="swap-card" data-place="${esc(sp.id)}"><canvas data-thumb="${esc(sp.id)}"></canvas><strong>${esc(sp.name)}</strong><small>${esc(sp.bloom.length ? monthRange(sp.bloom) : sp.habit)} · ${sp.h}m</small></button>`).join("")}</div>` : `<p class="muted">Set this area's light and moisture in Plan to see ideas.</p>`}
+    <button class="btn small" data-here="any">Choose any plant…</button>`, (body) => {
+    body.querySelectorAll("canvas[data-thumb]").forEach((canvas) => { const sp = speciesFor(state, canvas.dataset.thumb); if (sp) paintThumb(canvas, sp, showcaseMonth(sp)); });
+    body.querySelectorAll("[data-place]").forEach((btn) => btn.addEventListener("click", () => { ui.mode = { type: "place", speciesId: btn.dataset.place, status: "planned" }; closeSheet(); placeAt(x, y); }));
+    body.querySelector('[data-here="any"]').addEventListener("click", () => pickSpecies({ title: "Plan which plant?", identify: false, onPick: (id) => { ui.mode = { type: "place", speciesId: id, status: "planned" }; closeSheet(); placeAt(x, y); } }));
   });
 }
 
@@ -1073,6 +1121,7 @@ async function identifyFromBlob(blob, onPick, { placement = null, keepPhoto = fa
   }
   openSheet(`<h2>Looking closely…</h2><p class="muted">Claude is identifying your plant. This takes a few seconds.</p><div class="brush" style="margin:20px auto"></div>`);
   try {
+    const takenOn = await photoTakenOn(blob);
     const small = await resizeBlob(blob, 1600, 0.85);
     const photoKey = `photo:${uid("plant")}`;
     await putBlob(photoKey, small);
@@ -1087,8 +1136,8 @@ async function identifyFromBlob(blob, onPick, { placement = null, keepPhoto = fa
         const sp = normalizeSpecies(candidates[Number(btn.dataset.i)], "claude-id");
         sp.photoId = photoKey;
         state.species[sp.id] = sp;
-        if (keepPhoto && placement) (placement.photos ||= []).push({ id: photoKey, date: new Date().toISOString().slice(0, 10) });
-        if (keepPhoto && ui.draft) ui.draft.photoKey = photoKey;
+        if (keepPhoto && placement) (placement.photos ||= []).push({ id: photoKey, date: takenOn });
+        if (keepPhoto && ui.draft) { ui.draft.photoKey = photoKey; ui.draft.photoDate = takenOn; }
         save();
         onPick(sp.id);
       }));
@@ -1105,11 +1154,13 @@ async function newView({ fromSpot = null, fromLink = null } = {}) {
   const blob = await pickPhoto();
   if (!blob) return;
   toast("Adding your view…");
+  const taken = await photoTakenOn(blob);
   const resized = await resizeBlob(blob, 1600, 0.86);
   const id = uid("spot");
   await putBlob(`photo:${id}`, resized);
   const fromArea = fromSpot && fromLink ? nearestArea(fromSpot, fromLink.x, fromLink.y) : null;
   const spot = newSpot(id, fromLink?.label || `View ${state.spots.length + 1}`, `photo:${id}`, { light: fromArea?.light, moist: fromArea?.moist });
+  spot.photoDate = taken;
   if (fromSpot) {
     spot.links.push({ id: uid("link"), x: 0.5, y: 0.93, to: fromSpot.id, label: `Back to ${fromSpot.name}` });
     if (fromLink) fromLink.to = id;
@@ -1346,7 +1397,8 @@ function viewMoreSheet(spot) {
   openSheet(`<h2>${esc(spot.name)}</h2><div class="choice-list">
     <button class="choice" data-a="rename"><span><strong>Rename</strong></span></button>
     <button class="choice" data-a="scan"><span><strong>Find plants with Claude</strong><small>Marks plants and areas it can see</small></span></button>
-    <button class="choice" data-a="photo"><span><strong>Replace photo</strong><small>Retake it, e.g. after you've planted</small></span></button>
+    <button class="choice" data-a="photo"><span><strong>Add a photo of this view</strong><small>New or old: it's placed by the date it was taken</small></span></button>
+    <button class="choice" data-a="photos"><span><strong>Photos of this view (${spotPhotos(spot).length})</strong><small>See them all and correct dates</small></span></button>
     <button class="choice" data-a="start"><span><strong>Start walks here</strong></span></button>
     ${state.spots.length > 1 ? `<button class="choice" data-a="delete"><span><strong style="color:#a33">Delete this view</strong></span></button>` : ""}
   </div>`, (body) => body.querySelectorAll("[data-a]").forEach((btn) => btn.addEventListener("click", async () => {
@@ -1354,11 +1406,15 @@ function viewMoreSheet(spot) {
     if (a === "rename") { const name = await askText("Rename view", spot.name, spot.name); if (name) { spot.name = name; save(); refreshCurrentView(); } }
     if (a === "scan") { ui.spotId = spot.id; switchView("walk"); scanView(spot); }
     if (a === "start") { state.startSpotId = spot.id; save(); closeSheet(); toast("Walks now start here"); }
+    if (a === "photos") openViewPhotos(spot);
     if (a === "photo") {
       const blob = await pickPhoto();
       if (!blob) return;
-      await replaceSpotPhoto(spot, blob);
-      save(); closeSheet(); refreshCurrentView(); toast("Photo updated. The old one is kept in its history.");
+      const taken = await photoTakenOn(blob);
+      const older = spot.photoDate && taken < spot.photoDate;
+      await replaceSpotPhoto(spot, blob, taken);
+      save(); closeSheet(); refreshCurrentView();
+      toast(older ? `Added as an earlier photo (${fmtDate(taken)}). It's used for that time of year.` : `Photo from ${fmtDate(taken)} added. Earlier photos are kept.`, 4000);
     }
     if (a === "delete") {
       if (!confirm(`Delete "${spot.name}" and its pins?`)) return;
@@ -1395,8 +1451,9 @@ async function addDiaryPhoto(p) {
   const blob = await pickPhoto();
   if (!blob) return;
   const key = `photo:${uid("diary")}`;
+  const taken = await photoTakenOn(blob);
   await putBlob(key, await resizeBlob(blob, 1600, 0.86));
-  (p.photos ||= []).push({ id: key, date: isoDay(new Date()) });
+  (p.photos ||= []).push({ id: key, date: taken });
   save();
   openPlacementSheet(p.id);
   toast(p.confirmed ? "Added to the diary" : "Added. Tap it to identify the plant from this photo.");
@@ -1407,9 +1464,11 @@ async function openDiaryPhoto(p, photoId) {
   const sp = speciesFor(state, p.speciesId);
   openSheet(`<p class="eyebrow">${esc(sp?.name || "Plant")}</p><h2>${esc(fmtDate(ph.date))}</h2>
     <img class="viewer-img" src="${await photoUrl(ph.id)}" alt="" />
+    <label class="field">Taken on<input type="date" id="dv-date" value="${esc(ph.date || "")}" max="${isoDay(new Date())}" /></label>
     ${weatherLine(ph.date) ? `<p class="muted">${esc(weatherLine(ph.date))}</p>` : ""}
     <div class="sheet-actions"><button class="btn small dark" id="dv-id">Identify from this photo</button><button class="btn small" id="dv-back">Back</button><button class="btn small ghost" id="dv-del">Delete photo</button></div>`, (body) => {
     body.querySelector("#dv-back").addEventListener("click", () => openPlacementSheet(p.id));
+    body.querySelector("#dv-date").addEventListener("change", (e) => { if (e.target.value) { ph.date = e.target.value; save(); openDiaryPhoto(p, ph.id); } });
     body.querySelector("#dv-id").addEventListener("click", async () => identifyFromBlob(await getBlob(ph.id), (id) => { p.speciesId = id; p.confirmed = true; save(); renderWalk(); openPlacementSheet(p.id); }));
     body.querySelector("#dv-del").addEventListener("click", () => { if (!confirm("Delete this photo?")) return; p.photos = p.photos.filter((x) => x.id !== ph.id); save(); openPlacementSheet(p.id); });
   });
@@ -1430,27 +1489,32 @@ async function refreshWeather({ fromDate = null, force = false, quiet = true } =
   }
 }
 
-function wxChart(days, kind) {
-  const W = 340, H = 92, padL = 26, padB = 16, padT = 6;
-  const n = days.length, bw = (W - padL) / n;
+// One SVG per measure, a fixed width per day so it scrolls sideways; the axis lives in a separate column.
+const WX_DAY = 9, WX_H = 92, WX_PAD_B = 16, WX_PAD_T = 6;
+function wxScale(days, kind) {
   const vals = days.filter((d) => d.tmax != null);
-  if (!vals.length) return "";
-  let lo, hi;
-  if (kind === "temp") { lo = Math.min(0, Math.floor(Math.min(...vals.map((d) => d.tmin)) / 5) * 5); hi = Math.ceil(Math.max(...vals.map((d) => d.tmax)) / 5) * 5; }
-  else { lo = 0; hi = Math.max(5, Math.ceil(Math.max(...vals.map((d) => d.rain)) / 5) * 5); }
-  const y = (v) => padT + (H - padB - padT) * (1 - (v - lo) / (hi - lo || 1));
-  const ticks = kind === "temp" ? [lo, (lo + hi) / 2, hi] : [0, hi / 2, hi];
-  let svg = ticks.map((t) => `<line x1="${padL}" x2="${W}" y1="${y(t)}" y2="${y(t)}" stroke="#e2dac8" stroke-width="1"${t === 0 && kind === "temp" && lo < 0 ? ' stroke-dasharray="3 3" stroke="#9aa8b8"' : ""}/><text x="${padL - 4}" y="${y(t) + 3}" text-anchor="end">${Math.round(t)}${kind === "temp" ? "°" : ""}</text>`).join("");
+  if (kind === "temp") return [Math.min(0, Math.floor(Math.min(...vals.map((d) => d.tmin)) / 5) * 5), Math.ceil(Math.max(...vals.map((d) => d.tmax)) / 5) * 5];
+  return [0, Math.max(5, Math.ceil(Math.max(...vals.map((d) => d.rain)) / 5) * 5)];
+}
+function wxY(v, [lo, hi]) { return WX_PAD_T + (WX_H - WX_PAD_B - WX_PAD_T) * (1 - (v - lo) / (hi - lo || 1)); }
+function wxTicks(kind, [lo, hi]) { return kind === "temp" ? [lo, Math.round((lo + hi) / 2), hi] : [0, hi / 2, hi]; }
+function wxAxis(kind, scale) {
+  return `<svg viewBox="0 0 26 ${WX_H}" width="26" height="${WX_H}" aria-hidden="true">${wxTicks(kind, scale).map((t) => `<text x="22" y="${wxY(t, scale) + 3}" text-anchor="end">${Math.round(t)}${kind === "temp" ? "°" : ""}</text>`).join("")}</svg>`;
+}
+function wxChart(days, kind, scale) {
+  const W = days.length * WX_DAY;
+  let svg = wxTicks(kind, scale).map((t) => `<line x1="0" x2="${W}" y1="${wxY(t, scale)}" y2="${wxY(t, scale)}" stroke="${t === 0 && kind === "temp" && scale[0] < 0 ? "#9aa8b8" : "#e2dac8"}" stroke-width="1"${t === 0 && kind === "temp" && scale[0] < 0 ? ' stroke-dasharray="3 3"' : ""}/>`).join("");
   days.forEach((d, i) => {
-    const x = padL + i * bw + bw * 0.18, w = Math.max(2, bw * 0.64);
+    const x = i * WX_DAY + 1.5, w = WX_DAY - 3;
+    const date = new Date(`${d.date}T12:00:00`);
+    if (date.getDate() === 1) svg += `<line x1="${i * WX_DAY}" x2="${i * WX_DAY}" y1="${WX_PAD_T}" y2="${WX_H - WX_PAD_B + 4}" stroke="#d6cdb8" stroke-width="1"/><text x="${i * WX_DAY + 3}" y="${WX_H - 3}">${MON[date.getMonth()]}${date.getMonth() === 0 ? ` ${date.getFullYear()}` : ""}</text>`;
     if (d.tmax != null) {
-      if (kind === "temp") svg += `<rect x="${x}" y="${y(d.tmax)}" width="${w}" height="${Math.max(2, y(d.tmin) - y(d.tmax))}" rx="2" fill="#c46f4c"/>`;
-      else if (d.rain > 0) svg += `<rect x="${x}" y="${y(d.rain)}" width="${w}" height="${Math.max(1.5, y(0) - y(d.rain))}" rx="2" fill="#3f7fb8"/>`;
+      if (kind === "temp") svg += `<rect x="${x}" y="${wxY(d.tmax, scale)}" width="${w}" height="${Math.max(2, wxY(d.tmin, scale) - wxY(d.tmax, scale))}" rx="2" fill="#c46f4c"/>`;
+      else if (d.rain > 0) svg += `<rect x="${x}" y="${wxY(d.rain, scale)}" width="${w}" height="${Math.max(1.5, wxY(0, scale) - wxY(d.rain, scale))}" rx="2" fill="#3f7fb8"/>`;
     }
-    svg += `<rect class="wx-hit" data-i="${i}" x="${padL + i * bw}" y="0" width="${bw}" height="${H}" fill="transparent"/>`;
-    if (i % 7 === 0 && n - 1 - i >= 3) svg += `<text x="${padL + i * bw + bw / 2}" y="${H - 3}" text-anchor="middle">${new Date(`${d.date}T12:00:00`).getDate()} ${MON[new Date(`${d.date}T12:00:00`).getMonth()]}</text>`;
+    svg += `<rect class="wx-hit" data-i="${i}" x="${i * WX_DAY}" y="0" width="${WX_DAY}" height="${WX_H}" fill="transparent"/>`;
   });
-  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${kind === "temp" ? "Daily low to high temperature" : "Daily rainfall"}, last ${n} days">${svg}</svg>`;
+  return `<svg viewBox="0 0 ${W} ${WX_H}" width="${W}" height="${WX_H}" role="img" aria-label="${kind === "temp" ? "Daily low to high temperature" : "Daily rainfall"}">${svg}</svg>`;
 }
 
 function renderWeatherCard() {
@@ -1462,7 +1526,9 @@ function renderWeatherCard() {
     card.querySelector("#wx-set").addEventListener("click", openSettings);
     return;
   }
-  const days = lastDays(weatherLog.days, 30);
+  const logged = Object.keys(weatherLog.days).sort();
+  const days = logged.length ? lastDays(weatherLog.days, Math.max(30, Math.round((Date.now() - new Date(`${logged[0]}T12:00:00`)) / 864e5) + 1)) : [];
+  const tScale = days.length ? wxScale(days, "temp") : [0, 20], rScale = days.length ? wxScale(days, "rain") : [0, 5];
   const now = new Date();
   const thisM = monthSummary(weatherLog.days, now.getFullYear(), now.getMonth());
   const lastY = monthSummary(weatherLog.days, now.getFullYear() - 1, now.getMonth());
@@ -1479,8 +1545,11 @@ function renderWeatherCard() {
     ${thisM ? `<div class="wx-stats">${stat(`${thisM.tmax}°`, "avg high")}${stat(`${thisM.tmin}°`, "avg low")}${stat(`${thisM.rain}`, "mm rain")}${stat(thisM.frost, thisM.frost === 1 ? "frost" : "frosts")}</div>
     <p class="muted" style="margin:0 0 4px">${MONTHS[now.getMonth()]} so far${lastY ? `. Last ${MONTHS[now.getMonth()]}: ${lastY.tmax}° / ${lastY.tmin}°, ${lastY.rain} mm, ${lastY.frost} frosts` : ""}. Strongest gust ${Math.round(thisM.gust)} km/h.</p>` : ""}
     <div class="wx-chart" id="wx-chart">
-      <h3>Temperature, low to high · last 30 days</h3>${wxChart(days, "temp")}
-      <h3>Rainfall, mm</h3>${wxChart(days, "rain")}
+      <div class="wx-titles"><h3>Temperature, low to high</h3><span class="muted">Swipe to go back in time</span></div>
+      <div class="wx-frame">
+        <div class="wx-axis">${wxAxis("temp", tScale)}<div style="height:28px"></div>${wxAxis("rain", rScale)}</div>
+        <div class="wx-scroll" id="wx-scroll">${wxChart(days, "temp", tScale)}<h3 class="wx-sub">Rainfall, mm</h3>${wxChart(days, "rain", rScale)}</div>
+      </div>
       <div class="wx-tip" id="wx-tip" hidden></div>
     </div>
     ${rows.length ? `<table class="wx-table"><thead><tr><th>${now.getFullYear()}</th><th>Avg high</th><th>Avg low</th><th>Rain mm</th><th>Frosts</th></tr></thead><tbody>${rows.join("")}</tbody></table>${hasLastYear ? `<p class="muted" style="margin:6px 0 0">Small figures: same month last year.</p>` : ""}` : ""}
@@ -1492,7 +1561,7 @@ function renderWeatherCard() {
       if (d.tmax == null) { tip.hidden = true; return; }
       const r = hit.getBoundingClientRect(), c = chart.getBoundingClientRect();
       tip.textContent = `${fmtDate(d.date)} · ${d.tmin}–${d.tmax}°C · ${d.rain} mm · gusts ${Math.round(d.gust)} km/h`;
-      tip.style.left = `${Math.min(c.width - 90, Math.max(90, r.left - c.left + r.width / 2))}px`;
+      tip.style.left = `${Math.min(c.width - 110, Math.max(110, r.left - c.left + r.width / 2))}px`;
       tip.style.top = `${r.top - c.top + 18}px`;
       tip.hidden = false;
     };
@@ -1500,6 +1569,9 @@ function renderWeatherCard() {
     hit.addEventListener("click", show);
   });
   chart.addEventListener("pointerleave", () => { tip.hidden = true; });
+  const scroller = card.querySelector("#wx-scroll");
+  scroller.scrollLeft = scroller.scrollWidth;
+  scroller.addEventListener("scroll", () => { tip.hidden = true; }, { passive: true });
   card.querySelector("#wx-refresh").addEventListener("click", () => refreshWeather({ force: true, quiet: false }));
   card.querySelector("#wx-history")?.addEventListener("click", async (e) => {
     e.target.disabled = true; e.target.textContent = "Loading…";
@@ -1508,12 +1580,13 @@ function renderWeatherCard() {
 }
 
 /* ---------- guided photo walk ---------- */
-async function replaceSpotPhoto(spot, blob) {
+// Adds a photo to a view. A photo older than the current one joins the history instead of replacing it.
+async function replaceSpotPhoto(spot, blob, taken = null) {
+  taken ||= await photoTakenOn(blob);
   const key = `photo:${uid("spot")}`;
   await putBlob(key, await resizeBlob(blob, 1600, 0.86));
-  (spot.history ||= []).push({ photoId: spot.photoId, date: spot.photoDate || null });
-  spot.photoId = key;
-  spot.photoDate = isoDay(new Date());
+  (spot.history ||= []).push({ photoId: key, date: taken });
+  sortSpotPhotos(spot);
   pixelCache.delete(spot.id);
   [...baseCache.keys()].filter((k) => k.startsWith(`wc:${spot.id}:`)).forEach((k) => baseCache.delete(k));
   await deleteBlobsWithPrefix(`wc:${spot.id}:`);
@@ -1556,13 +1629,14 @@ function runGuidedWalk({ garden = null } = {}) {
         const blob = taken[step.key];
         if (!blob) continue;
         let spot = g.spots.find((sp) => sp.guideKey === step.key);
-        if (spot) await replaceSpotPhoto(spot, blob);
+        const taken = await photoTakenOn(blob);
+        if (spot) await replaceSpotPhoto(spot, blob, taken);
         else {
           const id = uid("spot");
           await putBlob(`photo:${id}`, await resizeBlob(blob, 1600, 0.86));
           spot = newSpot(id, step.title, `photo:${id}`);
           spot.guideKey = step.key;
-          spot.photoDate = isoDay(new Date());
+          spot.photoDate = taken;
           spot.areas = GUIDE_AREAS[step.key].map((a) => ({ id: uid("area"), light: "part", moist: "moist", maxH: 3, climbers: true, note: "Set its light and moisture so ideas fit.", ...a }));
           g.spots.push(spot);
         }
@@ -1628,6 +1702,46 @@ async function exportExcel() {
     console.error(error);
     toast(`Couldn't create the spreadsheet: ${error.message}`, 5000);
   }
+}
+
+async function openViewPhotos(spot) {
+  const list = spotPhotos(spot).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  const rows = await Promise.all(list.map(async (ph) => `<div class="row"><img class="thumb" src="${await photoUrl(ph.photoId)}" alt="" />
+    <div class="grow"><input type="date" data-date="${esc(ph.photoId)}" value="${esc(ph.date || "")}" max="${isoDay(new Date())}" />${ph.photoId === spot.photoId ? `<small>Main photo</small>` : ""}</div>
+    ${list.length > 1 ? `<button class="btn small ghost" data-del="${esc(ph.photoId)}">Delete</button>` : ""}</div>`));
+  openSheet(`<p class="eyebrow">${esc(spot.name)}</p><h2>Photos of this view</h2>
+    <p class="muted">Each month is drawn from the photo closest to that time of year. Dates are read from the photo where possible; correct them here.</p>
+    <div>${rows.join("")}</div>
+    <div class="sheet-actions"><button class="btn small dark" id="vp-add">Add a photo</button></div>`, (body) => {
+    const changed = () => {
+      sortSpotPhotos(spot);
+      [...baseCache.keys()].filter((k) => k.startsWith(`wc:${spot.id}:`)).forEach((k) => baseCache.delete(k));
+      save();
+      refreshCurrentView();
+    };
+    body.querySelectorAll("[data-date]").forEach((input) => input.addEventListener("change", () => {
+      const id = input.dataset.date;
+      if (id === spot.photoId) spot.photoDate = input.value || null;
+      else { const h = spot.history.find((x) => x.photoId === id); if (h) h.date = input.value || null; }
+      changed();
+      openViewPhotos(spot);
+    }));
+    body.querySelectorAll("[data-del]").forEach((btn) => btn.addEventListener("click", () => {
+      if (!confirm("Delete this photo?")) return;
+      const id = btn.dataset.del;
+      spot.history = (spot.history || []).filter((x) => x.photoId !== id);
+      if (spot.photoId === id) { const next = spot.history.pop(); spot.photoId = next.photoId; spot.photoDate = next.date; }
+      changed();
+      openViewPhotos(spot);
+    }));
+    body.querySelector("#vp-add").addEventListener("click", async () => {
+      const blob = await pickPhoto();
+      if (!blob) return;
+      await replaceSpotPhoto(spot, blob);
+      changed();
+      openViewPhotos(spot);
+    });
+  });
 }
 
 /* ---------- settings ---------- */
@@ -1861,7 +1975,7 @@ function onboarding() {
       button.disabled = true;
       button.textContent = "Sharpening pencils…";
       try {
-        const garden = await buildFirstGarden(await resizeBlob(blob, 1600, 0.86));
+        const garden = await buildFirstGarden(await resizeBlob(blob, 1600, 0.86), await photoTakenOn(blob));
         await setValue("state", garden);
         panel.hidden = true;
         document.body.classList.remove("onboarding");
