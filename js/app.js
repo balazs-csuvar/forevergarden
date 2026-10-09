@@ -5,7 +5,7 @@ import { paintPlant, paintExistingSeason, plantState } from "./painter.js";
 import { MONTHS, MON, monthRange, nearestArea, bloomCoverage, speciesFor, recommendFor, describeConditions, fitsConditions } from "./recommend.js";
 import * as ai from "./ai.js";
 
-const ENGINE = "wc4";
+const ENGINE = "sk3";
 const WORK_SIZE = 960;
 const SEASON_COLORS = ["#a7b6c8", "#b3c0c9", "#c3d39a", "#a6cf7a", "#8cc46a", "#e2a6bd", "#e6c25a", "#dba94a", "#c99a4a", "#c9773e", "#a86a48", "#9aa8b8"];
 const LIGHT_LABEL = { full: "Full sun (6h+)", part: "Part shade (3–6h)", shade: "Shade (<3h)" };
@@ -286,7 +286,7 @@ async function renderWalk({ animateMonth = false } = {}) {
   renderStones();
   const loading = $("#stage-loading");
   if (!baseCache.has(baseKey(spot, ui.month)) && !ui.photo) {
-    $("#loading-text").textContent = `Painting ${MONTHS[ui.month]}…`;
+    $("#loading-text").textContent = `Sketching ${MONTHS[ui.month]}…`;
     loading.classList.remove("hidden");
   }
   try {
@@ -1358,7 +1358,7 @@ function onboarding() {
       const blob = await pickPhoto();
       if (!blob) return;
       button.disabled = true;
-      button.textContent = "Getting your paints out…";
+      button.textContent = "Sharpening pencils…";
       try {
         const garden = await buildFirstGarden(await resizeBlob(blob, 1600, 0.86));
         await setValue("state", garden);
@@ -1396,7 +1396,7 @@ async function init() {
   bindEvents();
   switchView("walk");
   if (firstRun) {
-    setTimeout(() => openSheet(`<p class="eyebrow">Welcome to your garden</p><h2>Painted from your photo</h2>
+    setTimeout(() => openSheet(`<p class="eyebrow">Welcome to your garden</p><h2>Sketched from your photo</h2>
       <div class="stack" style="font-size:14.5px;line-height:1.55">
         <p style="margin:0"><strong>Find your plants:</strong> let Claude spot them in this photo, or switch on <strong>Edit</strong> and tap a plant to tag it.</p>
         <p style="margin:0"><strong>Grow your walk:</strong> in Edit, tap a corner and choose "Make a path", then take a photo from there.</p>

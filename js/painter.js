@@ -14,6 +14,8 @@ export function seededRandom(text) {
 }
 
 function hexToRgb(hex) {
+  // Seasonal blends come back as "rgb(r,g,b)"; everything else is "#rrggbb".
+  if (typeof hex === "string" && hex.startsWith("rgb")) return hex.match(/\d+/g).slice(0, 3).map(Number);
   const v = parseInt(String(hex || "#6b8a4a").replace("#", "").padEnd(6, "0").slice(0, 6), 16);
   return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
 }
@@ -75,18 +77,74 @@ function wash(ctx, cx, cy, rx, ry, color, alpha, rnd, points = 22) {
   ctx.stroke();
 }
 
-function canopy(ctx, cx, cy, rx, ry, color, rnd, density = 1) {
-  // Light, transparent glazes: a pale first wash, a few mid-tone leaf clusters, one shadow glaze.
-  const light = mix(color, "#fbf6e6", 0.35);
+// Fineliner width for the current drawing (set per paintPlant call from the canvas size).
+let LW = 1;
+const INK = (alpha) => `rgba(48,42,36,${alpha})`;
+
+// Garden-designer "cloud" outline: scalloped ink edge, a few leaf scribbles, hatched shadow side.
+function inkCloud(ctx, cx, cy, rx, ry, rnd, strength = 1) {
+  if (rx < 2 || ry < 2) return;
+  ctx.save();
   ctx.globalCompositeOperation = "source-over";
-  wash(ctx, cx, cy, rx, ry, light, 0.72 * density, rnd);
-  ctx.globalCompositeOperation = "multiply";
-  for (let i = 0; i < 6; i += 1) {
-    wash(ctx, cx + (rnd() - 0.5) * rx * 0.9, cy + (rnd() - 0.3) * ry * 0.8, rx * (0.28 + rnd() * 0.3), ry * (0.28 + rnd() * 0.3), color, 0.24 * density, rnd, 16);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  const bumps = Math.max(7, Math.min(30, Math.round((Math.PI * (rx + ry)) / Math.max(6, LW * 9))));
+  const start = rnd() * Math.PI * 2;
+  ctx.beginPath();
+  for (let i = 0; i <= bumps; i += 1) {
+    const a = start + (i / bumps) * Math.PI * 2;
+    const j = 0.93 + rnd() * 0.1;
+    const px = cx + Math.cos(a) * rx * j, py = cy + Math.sin(a) * ry * j;
+    if (i === 0) ctx.moveTo(px, py);
+    else {
+      const ma = start + ((i - 0.5) / bumps) * Math.PI * 2;
+      const bulge = 1.1 + rnd() * 0.08;
+      ctx.quadraticCurveTo(cx + Math.cos(ma) * rx * bulge, cy + Math.sin(ma) * ry * bulge, px, py);
+    }
   }
-  wash(ctx, cx + rx * 0.15, cy + ry * 0.4, rx * 0.7, ry * 0.4, shade(color, 0.75), 0.18 * density, rnd, 16);
+  ctx.lineWidth = LW;
+  ctx.strokeStyle = INK(0.85 * strength);
+  ctx.stroke();
+  const scribbles = Math.min(18, Math.round(3 + (rx * ry) / (LW * LW * 350)));
+  ctx.lineWidth = LW * 0.7;
+  ctx.strokeStyle = INK(0.5 * strength);
+  for (let i = 0; i < scribbles; i += 1) {
+    const a = rnd() * Math.PI * 2, d = Math.sqrt(rnd()) * 0.7;
+    const s = Math.max(LW * 2, Math.min(rx, ry) * (0.08 + rnd() * 0.06));
+    const a0 = Math.PI * (0.1 + rnd() * 0.5);
+    ctx.beginPath();
+    ctx.arc(cx + Math.cos(a) * rx * d, cy + Math.sin(a) * ry * d, s, a0, a0 + Math.PI * 0.85);
+    ctx.stroke();
+  }
+  // Shadow crescent on the lower right, hatched at 45°.
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rx * 0.97, ry * 0.97, 0, 0, Math.PI * 2);
+  ctx.ellipse(cx - rx * 0.28, cy - ry * 0.32, rx * 0.95, ry * 0.95, 0, 0, Math.PI * 2);
+  ctx.clip("evenodd");
+  ctx.lineWidth = LW * 0.6;
+  ctx.strokeStyle = INK(0.45 * strength);
+  ctx.beginPath();
+  const spacing = Math.max(2.5, LW * 3.2);
+  for (let t = -(rx + ry); t < rx + ry; t += spacing) {
+    ctx.moveTo(cx + t - ry, cy + ry);
+    ctx.lineTo(cx + t + ry, cy - ry);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+function canopy(ctx, cx, cy, rx, ry, color, rnd, density = 1) {
+  // Loose tint first (sketch colour never quite fills the outline), then the ink drawing.
+  // Laid on as fresh paint over the scene (not multiplied), so a new plant reads light and crisp.
+  const light = mix(color, "#fbf6e6", 0.5);
   ctx.globalCompositeOperation = "source-over";
-  wash(ctx, cx - rx * 0.3, cy - ry * 0.4, rx * 0.35, ry * 0.25, mix(color, "#fffbe8", 0.6), 0.3 * density, rnd, 14);
+  wash(ctx, cx + rx * 0.04, cy + ry * 0.05, rx * 0.95, ry * 0.92, light, 0.82 * density, rnd);
+  ctx.globalCompositeOperation = "multiply";
+  for (let i = 0; i < 3; i += 1) {
+    wash(ctx, cx + (rnd() - 0.3) * rx * 0.8, cy + (rnd() - 0.2) * ry * 0.7, rx * (0.3 + rnd() * 0.25), ry * (0.3 + rnd() * 0.25), mix(color, "#fbf6e6", 0.2), 0.16 * density, rnd, 14);
+  }
+  ctx.globalCompositeOperation = "source-over";
+  inkCloud(ctx, cx, cy, rx, ry, rnd, Math.max(0.35, Math.min(1, density)));
 }
 
 function dabs(ctx, cx, cy, rx, ry, color, count, size, rnd) {
@@ -95,18 +153,28 @@ function dabs(ctx, cx, cy, rx, ry, color, count, size, rnd) {
     const a = rnd() * Math.PI * 2, d = Math.sqrt(rnd());
     const x = cx + Math.cos(a) * rx * d, y = cy + Math.sin(a) * ry * d;
     const s = size * (0.6 + rnd() * 0.7);
-    wash(ctx, x, y, s, s * (0.75 + rnd() * 0.4), color, 0.82, rnd, 7);
-    if (rnd() < 0.35) wash(ctx, x - s * 0.25, y - s * 0.3, s * 0.35, s * 0.3, "#ffffff", 0.5, rnd, 5);
+    wash(ctx, x, y, s, s * (0.75 + rnd() * 0.4), color, 0.78, rnd, 7);
+    if (rnd() < 0.3) {
+      ctx.beginPath();
+      ctx.arc(x, y, s * 0.9, 0, Math.PI * 2);
+      ctx.lineWidth = LW * 0.55;
+      ctx.strokeStyle = INK(0.5);
+      ctx.stroke();
+    }
   }
 }
 
+// Coloured stroke with a fine ink line over it, so stems, blades and trunks read as drawn.
 function strokeLine(ctx, x0, y0, cx, cy, x1, y1, width, color, alpha) {
   ctx.beginPath();
   ctx.moveTo(x0, y0);
   ctx.quadraticCurveTo(cx, cy, x1, y1);
-  ctx.lineWidth = width;
   ctx.lineCap = "round";
-  ctx.strokeStyle = rgba(color, alpha);
+  ctx.lineWidth = width * 1.3;
+  ctx.strokeStyle = rgba(mix(color, "#fbf6e6", 0.35), alpha * 0.5);
+  ctx.stroke();
+  ctx.lineWidth = Math.min(width, LW * 0.75);
+  ctx.strokeStyle = INK(Math.min(0.6, alpha * 0.85));
   ctx.stroke();
 }
 
@@ -137,11 +205,21 @@ export function paintPlant(ctx, W, H, placement, sp, month, spot) {
   const hM = Math.min(sp.h, climberCap, placement.maxH || Infinity);
   const w = Math.max(6, Math.min(sp.s, sp.form === "climber" ? 1.6 : sp.s) * ppm), h = Math.max(6, hM * ppm);
   const stemColor = st.stems || "#6a5240";
+  LW = Math.max(0.8, Math.min(W, H) / 520);
 
-  // Soft shadow anchoring the plant to the ground.
+  // Ground shadow: a pale wash and a few horizontal ink strokes, as in a designer's sketch.
   ctx.globalCompositeOperation = "multiply";
-  wash(ctx, x + w * 0.06, baseY, w * 0.55, Math.max(2, w * 0.1), "#6b6255", 0.22, rnd, 14);
+  wash(ctx, x + w * 0.08, baseY, w * 0.55, Math.max(2, w * 0.09), "#8a8070", 0.18, rnd, 14);
   ctx.globalCompositeOperation = "source-over";
+  ctx.lineWidth = LW * 0.6;
+  ctx.strokeStyle = INK(0.45);
+  ctx.beginPath();
+  for (let i = 0; i < 4; i += 1) {
+    const yy = baseY + (i - 1) * Math.max(1.5, w * 0.025), half = w * (0.45 - Math.abs(i - 1) * 0.1);
+    ctx.moveTo(x - half * 0.6 + w * 0.12, yy);
+    ctx.lineTo(x + half + w * 0.12, yy);
+  }
+  ctx.stroke();
 
   const flowerSize = Math.max(1.6, Math.min(w * 0.035, W * 0.011));
   const flowerCount = Math.round(18 + Math.min(w * 0.12, (w * h) / (flowerSize * flowerSize * 40)));
@@ -196,6 +274,13 @@ export function paintPlant(ctx, W, H, placement, sp, month, spot) {
     }
     case "upright":
     case "airy": {
+      // Woody upright shrubs (dogwood, viburnum…) read as a tall cloud; stems only show when bare.
+      if (sp.form === "upright" && sp.habit !== "herbaceous") {
+        if (st.leaf > 0.15) canopy(ctx, x, baseY - h * 0.5, w * 0.42, h * 0.5, st.foliage, rnd, st.leaf);
+        if (st.leaf < 0.5) bareBranches(ctx, x, baseY, w * 0.8, h, st.stems || "#7a6250", rnd);
+        if (fl) dabs(ctx, x, baseY - h * 0.55, w * 0.36, h * 0.42, fl, Math.round(flowerCount * st.flowering), flowerSize, rnd);
+        break;
+      }
       const leafH = st.leaf > 0.2 ? h * st.leaf : h * 0.2;
       if (sp.form === "upright" && st.leaf > 0.15) canopy(ctx, x, baseY - leafH * 0.35, w / 2, leafH * 0.38, st.foliage, rnd, st.leaf);
       const stems = sp.form === "airy" ? 9 : 12;

@@ -1,7 +1,7 @@
 {
   "name": "ForeverGarden",
   "short_name": "ForeverGarden",
-  "description": "Your garden as a living watercolour: walk through it, watch it change through the year, and plan what to plant.",
+  "description": "Your garden as a living designer sketch: walk through it, watch it change through the year, and plan what to plant.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

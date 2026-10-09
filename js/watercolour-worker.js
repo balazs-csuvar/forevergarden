@@ -202,109 +202,191 @@ function sample(A, w, h, x, y) {
   return A[i] * (1 - fx) * (1 - fy) + A[i + 1] * fx * (1 - fy) + A[i + w] * (1 - fx) * fy + A[i + w + 1] * fx * fy;
 }
 
+function gaussian(A, w, h, sigma) {
+  // Large blurs: three box passes approximate a Gaussian at a fraction of the cost.
+  if (sigma > 1.6) {
+    const out = A.slice();
+    const r = Math.max(1, Math.round((-1 + Math.sqrt(1 + 4 * sigma * sigma)) / 2));
+    return boxBlur(out, w, h, r, 3);
+  }
+  const r = Math.max(1, Math.ceil(sigma * 3));
+  const kern = new Float32Array(2 * r + 1);
+  let sum = 0;
+  for (let i = -r; i <= r; i += 1) { kern[i + r] = Math.exp(-(i * i) / (2 * sigma * sigma)); sum += kern[i + r]; }
+  for (let i = 0; i < kern.length; i += 1) kern[i] /= sum;
+  const tmp = new Float32Array(A.length), out = new Float32Array(A.length);
+  for (let y = 0; y < h; y += 1) {
+    const row = y * w;
+    for (let x = 0; x < w; x += 1) {
+      let acc = 0;
+      for (let j = -r; j <= r; j += 1) acc += A[row + Math.min(w - 1, Math.max(0, x + j))] * kern[j + r];
+      tmp[row + x] = acc;
+    }
+  }
+  for (let x = 0; x < w; x += 1) {
+    for (let y = 0; y < h; y += 1) {
+      let acc = 0;
+      for (let j = -r; j <= r; j += 1) acc += tmp[Math.min(h - 1, Math.max(0, y + j)) * w + x] * kern[j + r];
+      out[y * w + x] = acc;
+    }
+  }
+  return out;
+}
+
+// Thin contour lines (Canny-style): gradient crest only, so ink reads as pen strokes, not blobs.
+// share = fraction of the image area that becomes line.
+function contourLines(A, w, h, share) {
+  const N = w * h;
+  const mag = new Float32Array(N), dir = new Uint8Array(N);
+  for (let y = 1; y < h - 1; y += 1) {
+    for (let x = 1; x < w - 1; x += 1) {
+      const i = y * w + x;
+      const gx = -A[i - w - 1] - 2 * A[i - 1] - A[i + w - 1] + A[i - w + 1] + 2 * A[i + 1] + A[i + w + 1];
+      const gy = -A[i - w - 1] - 2 * A[i - w] - A[i - w + 1] + A[i + w - 1] + 2 * A[i + w] + A[i + w + 1];
+      mag[i] = Math.hypot(gx, gy);
+      const ang = (Math.atan2(gy, gx) * 180) / Math.PI;
+      const a = (ang + 180) % 180;
+      dir[i] = a < 22.5 || a >= 157.5 ? 0 : a < 67.5 ? 1 : a < 112.5 ? 2 : 3;
+    }
+  }
+  const crest = new Float32Array(N);
+  const offs = [[1, 0], [1, 1], [0, 1], [-1, 1]];
+  const vals = [];
+  for (let y = 1; y < h - 1; y += 1) {
+    for (let x = 1; x < w - 1; x += 1) {
+      const i = y * w + x;
+      const [ox, oy] = offs[dir[i]];
+      const m = mag[i];
+      if (m >= mag[i + oy * w + ox] && m >= mag[i - oy * w - ox]) { crest[i] = m; if ((i & 3) === 0) vals.push(m); }
+    }
+  }
+  vals.sort((a, b) => a - b);
+  const crestFrac = (vals.length * 4) / N;
+  const keep = Math.min(0.95, share / Math.max(crestFrac, 1e-6));
+  const t1 = vals[Math.floor((1 - keep * 0.5) * (vals.length - 1))] || 1;
+  const t0 = vals[Math.floor((1 - keep) * (vals.length - 1))] || t1 * 0.5;
+  const out = new Float32Array(N);
+  for (let i = 0; i < N; i += 1) if (crest[i] > 0) out[i] = smoothstep(t0, Math.max(t1, t0 + 1e-6), crest[i]);
+  // Soften by a hair so lines are anti-aliased and slightly thicker where strong.
+  const soft = new Float32Array(N);
+  for (let y = 1; y < h - 1; y += 1) {
+    for (let x = 1; x < w - 1; x += 1) {
+      const i = y * w + x;
+      const n = Math.max(out[i - 1], out[i + 1], out[i - w], out[i + w]);
+      soft[i] = Math.max(out[i], n * 0.45 * out[i] + n * 0.3);
+    }
+  }
+  return soft;
+}
+
+// Share of the picture drawn in ink: outlines of masses, and finer detail lines.
+const INK_SHARE = { mass: 0.045, detail: 0.03 };
+
+// Stretch exposure so a dim or bright photo maps to the same tonal range before drawing.
+function normalizeExposure(src, w, h) {
+  const N = w * h;
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < N; i += 1) hist[(0.3 * src[i * 4] + 0.59 * src[i * 4 + 1] + 0.11 * src[i * 4 + 2]) | 0] += 1;
+  const pct = (q) => { let acc = 0; for (let v = 0; v < 256; v += 1) { acc += hist[v]; if (acc >= N * q) return v; } return 255; };
+  const lo = pct(0.02), hi = Math.max(lo + 20, pct(0.985)), med = pct(0.5);
+  const medN = Math.min(0.9, Math.max(0.1, (med - lo) / (hi - lo)));
+  const gamma = Math.log(0.5) / Math.log(medN);
+  const lut = new Float32Array(256);
+  for (let v = 0; v < 256; v += 1) lut[v] = Math.pow(Math.min(1, Math.max(0, (v - lo) / (hi - lo))), gamma) * 255;
+  const out = new Uint8ClampedArray(src.length);
+  for (let i = 0; i < src.length; i += 4) { out[i] = lut[src[i]]; out[i + 1] = lut[src[i + 1]]; out[i + 2] = lut[src[i + 2]]; out[i + 3] = 255; }
+  return out;
+}
+
+// Garden-designer sketch: ink linework + hatching carry the detail, a loose watercolour tint carries colour.
 function paint(src, w, h, month, pins, seed) {
   const N = w * h;
-  const k = w / 800;
+  const k = w / 900;
   const nz = makeNoise(seed || 7);
   const rnd = mulberry32((seed || 7) * 31 + 5);
   const decid = buildDeciduousMap(w, h, pins || []);
-  let [R, G, B] = seasonGrade(src, w, h, month, decid, nz);
-  // Structure lines come from a heavily blurred luma so they follow big shapes, not foliage texture.
-  const structL = new Float32Array(N);
-  for (let i = 0; i < N; i += 1) structL[i] = 0.3 * R[i] + 0.59 * G[i] + 0.11 * B[i];
-  boxBlur(structL, w, h, Math.max(2, Math.round(3 * k)), 3);
-  [R, G, B] = kuwahara(R, G, B, w, h, Math.max(2, Math.round(4 * k)));
-  // Wet-in-wet: soften the Kuwahara blocks into flowing washes, keeping some crisp edges.
-  const sR = R.slice(), sG = G.slice(), sB = B.slice();
-  const br = Math.max(2, Math.round(5 * k));
-  boxBlur(sR, w, h, br, 2); boxBlur(sG, w, h, br, 2); boxBlur(sB, w, h, br, 2);
-  for (let i = 0; i < N; i += 1) {
-    const wet = 0.55 + 0.3 * nz.fbm((i % w) * 0.01, ((i / w) | 0) * 0.01, 2);
-    R[i] += (sR[i] - R[i]) * wet; G[i] += (sG[i] - G[i]) * wet; B[i] += (sB[i] - B[i]) * wet;
-  }
+  const [R, G, B] = seasonGrade(normalizeExposure(src, w, h), w, h, month, decid, nz);
 
-  // Wobble: pigment bleeds slightly past shapes.
-  const wR = new Float32Array(N), wG = new Float32Array(N), wB = new Float32Array(N);
-  const amp = 1.8 * k;
-  for (let y = 0; y < h; y += 1) {
-    for (let x = 0; x < w; x += 1) {
-      const dx = (nz.fbm(x * 0.009 / k, y * 0.009 / k, 2) - 0.5) * 2 * amp;
-      const dy = (nz.fbm(x * 0.009 / k + 50, y * 0.009 / k + 50, 2) - 0.5) * 2 * amp;
-      const i = y * w + x;
-      wR[i] = sample(R, w, h, x + dx, y + dy); wG[i] = sample(G, w, h, x + dx, y + dy); wB[i] = sample(B, w, h, x + dx, y + dy);
-    }
-  }
-
-  // Wash: layered glazes, lighter pigment, gentle saturation lift.
+  // Edge-preserving clean-up so lines follow real edges, not photo noise.
+  // Two levels: light clean-up for hard landscaping, heavier simplification so foliage reads as masses.
+  const [kR, kG, kB] = kuwahara(R, G, B, w, h, Math.max(1, Math.round(1.5 * k)));
   const L = new Float32Array(N);
-  for (let i = 0; i < N; i += 1) {
-    let r = wR[i], g = wG[i], b = wB[i];
-    const l = 0.3 * r + 0.59 * g + 0.11 * b;
-    const q = Math.round(l * 6) / 6;
-    const f = 1 + ((q + 0.02) / (l + 0.02) - 1) * 0.12;
-    r *= f; g *= f; b *= f;
-    const l2 = 0.3 * r + 0.59 * g + 0.11 * b;
-    r = l2 + (r - l2) * 1.25; g = l2 + (g - l2) * 1.25; b = l2 + (b - l2) * 1.25;
-    // Transparent pigment: lift the darks hard, the paper does the rest.
-    const lift = (c) => 1 - Math.pow(Math.min(1, Math.max(0, 1 - c)), 1.15) * 0.7;
-    r = lift(r); g = lift(g); b = lift(b);
-    wR[i] = r; wG[i] = g; wB[i] = b;
-    L[i] = 0.3 * r + 0.59 * g + 0.11 * b;
-  }
+  for (let i = 0; i < N; i += 1) L[i] = Math.min(1, Math.max(0, 0.3 * kR[i] + 0.59 * kG[i] + 0.11 * kB[i]));
+  // A round blur (not a square filter) so foliage masses get soft, cloud-like outlines.
+  const M = gaussian(L, w, h, 2.6 * k);
+
+  // Ink lines: thin contours of the simplified masses, plus finer detail on the lightly cleaned image.
+  const massLines = contourLines(M, w, h, INK_SHARE.mass);
+  const detailLines = contourLines(gaussian(L, w, h, 0.9 * k), w, h, INK_SHARE.detail);
+  const T = gaussian(L, w, h, 2.5 * k);
+
+  // Soft, misregistered colour for the tint.
+  const sig = 3 * k;
+  const cR = gaussian(kR, w, h, sig), cG = gaussian(kG, w, h, sig), cB = gaussian(kB, w, h, sig);
 
   const out = new Uint8ClampedArray(N * 4);
-  const paper = [0.988, 0.974, 0.942];
-  const sepia = [0.36, 0.29, 0.23];
-  const border = 0.055 * Math.min(w, h);
+  const paper = [0.99, 0.978, 0.95];
+  const inkC = [0.2, 0.18, 0.16];
+  const border = 0.05 * Math.min(w, h);
+  const sp = 4.2 * k;
+  const amp = 3.2 * k;
   for (let y = 0; y < h; y += 1) {
     for (let x = 0; x < w; x += 1) {
       const i = y * w + x;
-      // Sobel on the wash: edges collect pigment; strongest become sketch lines.
-      let gx = 0, gy = 0;
-      if (x > 0 && y > 0 && x < w - 1 && y < h - 1) {
-        gx = -L[i - w - 1] - 2 * L[i - 1] - L[i + w - 1] + L[i - w + 1] + 2 * L[i + 1] + L[i + w + 1];
-        gy = -L[i - w - 1] - 2 * L[i - w] - L[i - w + 1] + L[i + w - 1] + 2 * L[i + w] + L[i + w + 1];
-      }
-      const gm = Math.sqrt(gx * gx + gy * gy);
-      const darken = 1 - 0.12 * smoothstep(0.04, 0.22, gm);
-      let sx = 0, sy = 0;
-      if (x > 0 && y > 0 && x < w - 1 && y < h - 1) {
-        sx = -structL[i - w - 1] - 2 * structL[i - 1] - structL[i + w - 1] + structL[i - w + 1] + 2 * structL[i + 1] + structL[i + w + 1];
-        sy = -structL[i - w - 1] - 2 * structL[i - w] - structL[i - w + 1] + structL[i + w - 1] + 2 * structL[i + w] + structL[i + w + 1];
-      }
-      const sg = Math.sqrt(sx * sx + sy * sy) / k;
-      const line = smoothstep(0.1, 0.22, sg) * 0.32 * (0.6 + 0.8 * nz.fbm(x * 0.05, y * 0.05, 2));
-      let r = wR[i] * darken, g = wG[i] * darken, b = wB[i] * darken;
-      r += (sepia[0] - r) * line; g += (sepia[1] - g) * line; b += (sepia[2] - b) * line;
 
-      // Granulation: pigment settles into the paper grain, more so in dense washes.
-      const dens = 1 - L[i];
-      const gran = (rnd() - 0.5) * 0.07 + (nz.fbm(x * 0.21, y * 0.21, 2) - 0.5) * 0.1;
-      const gf = 1 + gran * (0.4 + dens);
-      r *= gf; g *= gf; b *= gf;
+      // Outlines of masses (shrubs, canopies, beds) plus crisp detail lines on strong edges only.
+      const lineInk = Math.min(1, massLines[i] * 0.95 + detailLines[i] * 0.6);
 
-      // Blooms / cauliflower marks: low-frequency density variation.
-      const bloom = (nz.fbm(x * 0.006 / k + 9, y * 0.006 / k, 4) - 0.5) * 0.2;
-      r = 1 - (1 - r) * (1 + bloom); g = 1 - (1 - g) * (1 + bloom); b = 1 - (1 - b) * (1 + bloom);
+      // Hatching follows tone: single diagonal in shade, cross-hatch in deep shade.
+      const t = T[i];
+      const wob = (nz.fbm(x * 0.02 / k, y * 0.02 / k, 2) - 0.5) * 1.1;
+      const u1 = (x + y) / (sp * 1.414) + wob;
+      const u2 = (x - y) / (sp * 1.414) - wob;
+      const l1 = 1 - smoothstep(0.07, 0.17, Math.abs(u1 - Math.round(u1)));
+      const l2 = 1 - smoothstep(0.07, 0.17, Math.abs(u2 - Math.round(u2)));
+      const dash = smoothstep(0.32, 0.5, nz.noise(x * 0.06 / k, y * 0.18 / k));
+      const hatch = Math.max(l1 * smoothstep(0.34, 0.2, t), l2 * smoothstep(0.2, 0.08, t)) * dash;
 
-      // Unpainted sparkles in the lightest areas.
-      const sparkle = smoothstep(0.7, 0.8, nz.fbm(x * 0.09, y * 0.09, 2)) * smoothstep(0.7, 0.9, L[i]);
-      r += (1 - r) * sparkle; g += (1 - g) * sparkle; b += (1 - b) * sparkle;
-
-      // Ragged painted edge with pooled pigment just inside it.
+      // Ragged sheet: colour stops short, ink runs closer to the edge.
       const edgeDist = Math.min(x, w - 1 - x, y, h - 1 - y) / border;
-      const jag = (nz.fbm(x * 0.012, y * 0.012, 4) - 0.5) * 1.6 + (nz.fbm(x * 0.06, y * 0.06, 2) - 0.5) * 0.4;
+      const jag = (nz.fbm(x * 0.012, y * 0.012, 4) - 0.5) * 1.8 + (nz.fbm(x * 0.07, y * 0.07, 2) - 0.5) * 0.4;
       const d = edgeDist + jag;
-      const m = smoothstep(0.35, 0.75, d);
-      const rim = Math.exp(-((d - 0.8) ** 2) / 0.015) * 0.07;
-      r *= 1 - rim; g *= 1 - rim; b *= 1 - rim;
+      const colourMask = smoothstep(0.8, 1.6, d);
+      const inkMask = smoothstep(0.45, 0.85, d);
 
-      const fibre = 0.975 + 0.025 * nz.fbm(x * 0.11, y * 0.11, 2) + (rnd() - 0.5) * 0.012;
-      const pr = paper[0] * fibre, pg = paper[1] * fibre, pb = paper[2] * fibre;
-      const fr = pr * Math.min(1.02, Math.max(0, r)), fg = pg * Math.min(1.02, Math.max(0, g)), fb = pb * Math.min(1.02, Math.max(0, b));
-      out[i * 4] = (pr + (fr - pr) * m) * 255;
-      out[i * 4 + 1] = (pg + (fg - pg) * m) * 255;
-      out[i * 4 + 2] = (pb + (fb - pb) * m) * 255;
+      // Tint: offset sample, lightened and a touch more saturated; leaves white paper in places.
+      const dx = (nz.fbm(x * 0.008 / k, y * 0.008 / k, 2) - 0.5) * 2 * amp;
+      const dy = (nz.fbm(x * 0.008 / k + 40, y * 0.008 / k + 40, 2) - 0.5) * 2 * amp;
+      let r = sample(cR, w, h, x + dx, y + dy), g = sample(cG, w, h, x + dx, y + dy), b = sample(cB, w, h, x + dx, y + dy);
+      const lum = 0.3 * r + 0.59 * g + 0.11 * b;
+      r = lum + (r - lum) * 1.5; g = lum + (g - lum) * 1.5; b = lum + (b - lum) * 1.5;
+      const lift = (c) => 1 - Math.min(1, Math.max(0, 1 - c)) * 0.45;
+      r = lift(r); g = lift(g); b = lift(b);
+      // Colour goes where the planting is (saturated areas); paving and soil stay mostly paper.
+      const mx = Math.max(cR[i], cG[i], cB[i]), mn = Math.min(cR[i], cG[i], cB[i]);
+      const chroma = mx - mn;
+      const patch = nz.fbm(x * 0.004 / k + 7, y * 0.004 / k, 3);
+      let m = smoothstep(0.04, 0.14, chroma) * 0.6 + 0.4;
+      m *= smoothstep(0.2, 0.45, patch + 0.12);
+      m *= 1 - smoothstep(0.75, 0.92, t) * 0.8;
+      m *= colourMask;
+      const rim = (1 - Math.abs(2 * m - 1)) * 0.08 * colourMask;
+      const gran = 1 + (rnd() - 0.5) * 0.05 + (nz.fbm(x * 0.25, y * 0.25, 2) - 0.5) * 0.08 * m;
+
+      const fibre = 0.978 + 0.022 * nz.fbm(x * 0.12, y * 0.12, 2);
+      let fr = paper[0] * fibre * (1 - m * (1 - r)) * (1 - rim) * gran;
+      let fg = paper[1] * fibre * (1 - m * (1 - g)) * (1 - rim) * gran;
+      let fb = paper[2] * fibre * (1 - m * (1 - b)) * (1 - rim) * gran;
+
+      // Ink pressure varies a little, like a fineliner.
+      const pressure = 0.75 + 0.35 * nz.noise(x * 0.03 / k + 3, y * 0.03 / k);
+      const a = Math.min(0.95, (lineInk * 0.95 + hatch * 0.5) * pressure) * inkMask;
+      fr = fr * (1 - a) + inkC[0] * a;
+      fg = fg * (1 - a) + inkC[1] * a;
+      fb = fb * (1 - a) + inkC[2] * a;
+      out[i * 4] = fr * 255;
+      out[i * 4 + 1] = fg * 255;
+      out[i * 4 + 2] = fb * 255;
       out[i * 4 + 3] = 255;
     }
   }

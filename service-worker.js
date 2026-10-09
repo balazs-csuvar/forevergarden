@@ -1,4 +1,4 @@
-const CACHE_NAME = "forevergarden-v3";
+const CACHE_NAME = "forevergarden-v4";
 const APP_FILES = [
   "./", "./index.html", "./styles.css", "./manifest.json",
   "./js/app.js", "./js/store.js", "./js/plants.js", "./js/seed.js", "./js/painter.js", "./js/recommend.js", "./js/ai.js", "./js/watercolour-worker.js",
