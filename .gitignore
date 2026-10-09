@@ -1,0 +1,7 @@
+# Personal photos: never publish
+*.jpg
+*.jpeg
+*.heic
+*.png
+!icons/*.png
+
