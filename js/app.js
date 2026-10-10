@@ -7,7 +7,7 @@ import { photoTakenOn } from "./exif.js";
 import { MONTHS, MON, monthRange, nearestArea, bloomCoverage, speciesFor, recommendFor, describeConditions, fitsConditions } from "./recommend.js";
 import * as ai from "./ai.js";
 import { loadWeather, syncWeather, findPlace, monthSummary, lastDays, isoDay } from "./weather.js";
-import { newPlan, bounds, signedArea, centroid, describeSize, setSideLength, presetArea, cameraFor, linkSpot, fmtM, planSvg, mountPlanEditor } from "./guided.js";
+import { newPlan, bounds, signedArea, centroid, describeSize, setSideLength, presetArea, cameraFor, linkSpot, fmtM, planSvg, mountPlanEditor, settleAreas, shotsFor, shotsOf, isSectioned } from "./guided.js";
 
 const ENGINE = "sk5";
 const WORK_SIZE = 1200;
@@ -1462,6 +1462,16 @@ Suggest 5 plants that genuinely suit this exact spot and work with what is alrea
 }
 
 /* ---------- plants & views ---------- */
+// The view behind a tapped part of the plan: a border section, or a whole area.
+function planTapSpot(el) {
+  const shotKey = el.closest?.("[data-shot]")?.dataset.shot;
+  const areaId = shotKey ? shotKey.split("#")[0] : el.closest?.("[data-area]")?.dataset.area;
+  if (!areaId) return null;
+  const index = shotKey ? Number(shotKey.split("#")[1]) : null;
+  const mine = state.spots.filter((s) => s.planAreaId === areaId);
+  return mine.find((s) => (s.planSection ?? null) === index) || mine[0] || null;
+}
+
 async function renderPlants() {
   const rows = await Promise.all(state.spots.map(async (spot) => {
     const here = state.placements.filter((p) => p.spotId === spot.id);
@@ -1472,10 +1482,7 @@ async function renderPlants() {
   planCard.hidden = !state.plan;
   if (state.plan) {
     $("#plan-figure").innerHTML = planSvg(state.plan, { widthPx: Math.min(560, window.innerWidth - 66), heightPx: window.innerHeight * 0.52 }, 'class="plan-svg" role="img" aria-label="Plan of your garden"');
-    $("#plan-figure").querySelectorAll("[data-area]").forEach((el) => {
-      const a = state.plan.areas.find((x) => x.id === el.dataset.area);
-      if (a?.spotId && state.spots.some((s) => s.id === a.spotId)) el.classList.add("tappable");
-    });
+    $("#plan-figure").querySelectorAll("[data-area], [data-shot]").forEach((el) => { if (planTapSpot(el)) el.classList.add("tappable"); });
   }
   const existing = state.placements.filter((p) => p.status === "existing");
   $("#existing-count").textContent = `${existing.length} recorded · ${existing.filter((p) => !p.confirmed).length} to confirm`;
@@ -1697,13 +1704,16 @@ function runGuidedWalk({ garden = null } = {}) {
     panel.hidden = false;
     const close = (result) => { panel.hidden = true; panel.innerHTML = ""; document.body.classList.remove("guiding"); resolve(result); };
     const dots = () => {
-      const all = ["size", "shape", "areas", ...(work.plan?.areas || []).map((_, k) => `photo${k}`)];
+      const all = ["size", "shape", "areas", ...(work.plan ? shotsFor(work.plan) : []).map((_, k) => `photo${k}`)];
       const now = step === "photo" ? `photo${photoIndex}` : step;
       const at = all.indexOf(now);
       return `<div class="guide-dots">${all.map((_, k) => `<i class="${k < at ? "done" : k === at ? "now" : ""}"></i>`).join("")}</div>`;
     };
     const top = (backLabel) => `<div class="guide-top"><button class="btn small ghost" id="g-back">${backLabel}</button>${dots()}</div>`;
     const num = (v) => { const n = parseFloat(String(v).replace(",", ".")); return Number.isFinite(n) && n > 0 ? n : null; };
+    // Areas always sit inside the garden without overlapping: `keep` holds its shape, others give way.
+    const settle = (keep = []) => { const notes = settleAreas(work.plan, keep); if (notes.length) toast(notes.join(" · ")); };
+    const shotSpot = (g, sh) => g?.spots.find((sp) => sp.planAreaId === sh.area.id && (sp.planSection ?? null) === sh.index);
     // Inline editors under the plan: type a side's length, or remove a tapped corner.
     const sideEditor = (box, pts, i, apply) => {
       const a = pts[i], b = pts[(i + 1) % pts.length];
@@ -1743,6 +1753,7 @@ function runGuidedWalk({ garden = null } = {}) {
           const scale = (pts) => pts.map(([x, y]) => [+((x - ob.x0) * sx).toFixed(1), +((y - ob.y0) * sy).toFixed(1)]);
           work.plan.outline = scale(work.plan.outline);
           work.plan.areas.forEach((a) => { a.poly = scale(a.poly); });
+          settle();
         } else work.plan = fresh;
         step = "shape"; render();
       });
@@ -1758,89 +1769,101 @@ function runGuidedWalk({ garden = null } = {}) {
       const edit = panel.querySelector("#g-edit");
       const editor = mountPlanEditor(panel.querySelector(".plan-editor"), work.plan, {
         mode: "shape",
-        onSide: (i) => sideEditor(edit, work.plan.outline, i, (v) => { work.plan.outline = setSideLength(work.plan.outline, i, v); renderShape(); }),
-        onCorner: (i) => { if (work.plan.outline.length > 3) cornerEditor(edit, () => { work.plan.outline.splice(i, 1); renderShape(); }); }
+        onSide: (i) => sideEditor(edit, work.plan.outline, i, (v) => { work.plan.outline = setSideLength(work.plan.outline, i, v); settle(); renderShape(); }),
+        onCorner: (i) => { if (work.plan.outline.length > 3) cornerEditor(edit, () => { work.plan.outline.splice(i, 1); settle(); renderShape(); }); },
+        onCommit: () => settle()
       });
       panel.querySelector("#g-back").addEventListener("click", () => { step = "size"; render(); });
       panel.querySelector("#g-next").addEventListener("click", () => {
         if (Math.abs(signedArea(work.plan.outline)) < 1) { toast("The garden shape looks too small"); return; }
-        if (!work.plan.areas.length) ["left", "right", "back"].forEach((kind) => work.plan.areas.push({ id: uid("parea"), ...presetArea(work.plan, kind) }));
+        if (!work.plan.areas.length) ["back", "left", "right"].forEach((kind) => work.plan.areas.push({ id: uid("parea"), ...presetArea(work.plan, kind) }));
+        settleAreas(work.plan);
         step = "areas"; render();
       });
     };
 
     const renderAreas = (selectId = null) => {
       const usedNames = new Set(work.plan.areas.map((a) => a.name));
-      const presets = [["left", "Left border"], ["right", "Right border"], ["back", "Back of the garden"], ["middle", "Lawn"], ["other", "Other area"]];
+      const presets = [["left", "Left border"], ["right", "Right border"], ["back", "Back border"], ["middle", "Lawn"], ["other", "Other area"]];
       panel.innerHTML = `${top("Back")}
         <p class="eyebrow">Your garden plan</p>
         <h1>Areas to <em>photograph</em></h1>
-        <p class="muted" style="margin:0">One photo each. Tap an area to rename it or drag its corners; tap + below to add more.</p>
+        <p class="muted" style="margin:0">Tap an area to rename it or drag its corners; tap + below to add more. Borders are photographed in 2–3 m sections for close-up detail. Overlaps are trimmed for you.</p>
         <svg class="plan-editor" font-family="DM Sans, sans-serif" role="img" aria-label="Plan of the garden with areas"></svg>
         <div id="g-edit" class="plan-edit"></div>
         <div class="chip-row">${presets.filter(([k, label]) => k === "other" || !usedNames.has(label)).map(([k, label]) => `<button class="btn small" data-preset="${k}">+ ${label}</button>`).join("")}</div>
-        <button class="btn dark onboard-btn" id="g-next" ${work.plan.areas.length ? "" : "disabled"}>Next: take ${work.plan.areas.length || ""} photo${work.plan.areas.length === 1 ? "" : "s"}</button>`;
+        <button class="btn dark onboard-btn" id="g-next" ${work.plan.areas.length ? "" : "disabled"}>Next: take ${shotsFor(work.plan).length || ""} photo${shotsFor(work.plan).length === 1 ? "" : "s"}</button>`;
       const edit = panel.querySelector("#g-edit");
+      const areaSummary = (a) => { const sh = shotsOf(a); return `${describeSize(a.poly)} · ${sh.length > 1 ? `${sh.length} photos of ${fmtM(sh[0].length)}` : "1 photo"}`; };
+      const nextLabel = () => { const n = shotsFor(work.plan).length; panel.querySelector("#g-next").textContent = `Next: take ${n} photo${n === 1 ? "" : "s"}`; };
       const showSelected = (id) => {
         const a = work.plan.areas.find((x) => x.id === id);
         if (!a) { edit.innerHTML = `<p class="muted" style="margin:0">${work.plan.areas.length ? "Tap an area on the plan to change it." : "Add the areas you'd like to photograph."}</p>`; return; }
         edit.innerHTML = `<div class="plan-edit-row"><label class="field grow">Name<input type="text" id="g-aname" value="${esc(a.name)}" /></label><button class="btn small ghost" id="g-adel">Remove</button></div>
-          <p class="muted" style="margin:4px 0 0" id="g-asize">${describeSize(a.poly)}${a.spotId ? " · has photos" : ""}</p>`;
+          <div class="plan-edit-row" style="margin-top:6px;align-items:center"><span class="grow muted" id="g-asize">${areaSummary(a)}</span><button class="btn small" id="g-asec">${isSectioned(a) ? "One photo instead" : "Photograph in sections"}</button></div>`;
         const name = edit.querySelector("#g-aname");
-        name.addEventListener("input", () => { a.name = name.value.trim() || "Unnamed area"; editor.render(); });
+        name.addEventListener("input", () => { a.name = name.value.trim() || "Unnamed area"; editor.render(); edit.querySelector("#g-asize").textContent = areaSummary(a); edit.querySelector("#g-asec").textContent = isSectioned(a) ? "One photo instead" : "Photograph in sections"; nextLabel(); });
+        edit.querySelector("#g-asec").addEventListener("click", () => { a.sections = !isSectioned(a); renderAreas(a.id); });
         edit.querySelector("#g-adel").addEventListener("click", () => { work.plan.areas = work.plan.areas.filter((x) => x.id !== a.id); renderAreas(); });
       };
       const editor = mountPlanEditor(panel.querySelector(".plan-editor"), work.plan, {
         mode: "areas",
         onSelect: showSelected,
-        onChange: () => { const s = edit.querySelector("#g-asize"); const a = work.plan.areas.find((x) => x.id === editor.selected); if (s && a) s.textContent = describeSize(a.poly); },
+        onChange: () => { const s = edit.querySelector("#g-asize"); const a = work.plan.areas.find((x) => x.id === editor.selected); if (s && a) s.textContent = areaSummary(a); },
+        onCommit: () => { const id = editor.selected; settle(id ? [id] : []); renderAreas(work.plan.areas.some((x) => x.id === id) ? id : null); },
         onSide: (i) => {
           const a = work.plan.areas.find((x) => x.id === editor.selected);
           if (!a) return;
-          sideEditor(edit, a.poly, i, (v) => { a.poly = setSideLength(a.poly, i, v); renderAreas(a.id); });
+          sideEditor(edit, a.poly, i, (v) => { a.poly = setSideLength(a.poly, i, v); settle([a.id]); renderAreas(work.plan.areas.includes(a) ? a.id : null); });
         },
         onCorner: (i) => {
           const a = work.plan.areas.find((x) => x.id === editor.selected);
-          if (a && a.poly.length > 3) cornerEditor(edit, () => { a.poly.splice(i, 1); renderAreas(a.id); });
+          if (a && a.poly.length > 3) cornerEditor(edit, () => { a.poly.splice(i, 1); settle([a.id]); renderAreas(a.id); });
         }
       });
       if (selectId) editor.select(selectId);
       showSelected(selectId);
       panel.querySelectorAll("[data-preset]").forEach((btn) => btn.addEventListener("click", () => {
         const a = { id: uid("parea"), ...presetArea(work.plan, btn.dataset.preset) };
+        // A new area fits around the ones already there.
+        settle(work.plan.areas.map((x) => x.id));
         work.plan.areas.push(a);
+        const notes = settleAreas(work.plan, work.plan.areas.filter((x) => x !== a).map((x) => x.id));
+        if (!work.plan.areas.includes(a)) { toast(`No room for ${a.name}: move or shrink an area first`); renderAreas(); return; }
+        if (notes.length) toast(`Fitted ${a.name} around your other areas`);
         renderAreas(a.id);
       }));
       panel.querySelector("#g-back").addEventListener("click", () => { step = "shape"; render(); });
-      panel.querySelector("#g-next").addEventListener("click", () => { if (!work.plan.areas.length) return; photoIndex = 0; step = "photo"; render(); });
+      panel.querySelector("#g-next").addEventListener("click", () => { if (!work.plan.areas.length) return; settle(); photoIndex = 0; step = "photo"; render(); });
     };
 
     const renderPhoto = () => {
-      const areas = work.plan.areas;
-      const a = areas[photoIndex];
-      const cam = cameraFor(work.plan, a);
-      const existing = garden?.spots.find((sp) => sp.planAreaId === a.id);
-      const shot = work.photos[a.id];
+      const shots = shotsFor(work.plan);
+      const sh = shots[photoIndex];
+      const cam = cameraFor(work.plan, sh);
+      const existing = shotSpot(garden, sh);
+      const taken = work.photos[sh.key];
+      const what = sh.count > 1 ? `this ${fmtM(sh.length)} section` : `the ${esc(sh.area.name.toLowerCase())}`;
       panel.innerHTML = `${top("Back")}
-        <p class="eyebrow">Photo ${photoIndex + 1} of ${areas.length}${existing ? " · retake for this season" : ""}</p>
-        <h1>${esc(a.name)}</h1>
-        ${planSvg(work.plan, { highlight: a.id, camera: cam, widthPx: Math.min(440, window.innerWidth - 48), heightPx: window.innerHeight * 0.34 }, 'class="plan-svg guide-plan" role="img" aria-label="Plan showing where to stand"')}
+        <p class="eyebrow">Photo ${photoIndex + 1} of ${shots.length}${existing ? " · retake for this season" : ""}</p>
+        <h1>${esc(sh.area.name)}${sh.count > 1 ? ` <em>${sh.index + 1} of ${sh.count}</em>` : ""}</h1>
+        ${planSvg(work.plan, { highlight: sh.area.id, shot: sh.count > 1 ? sh : null, camera: cam, widthPx: Math.min(440, window.innerWidth - 48), heightPx: window.innerHeight * 0.34 }, 'class="plan-svg guide-plan" role="img" aria-label="Plan showing what to photograph and where to stand"')}
         <p class="lede">${cam.along
-          ? `Stand at the house end, just beside the ${esc(a.name.toLowerCase())}, and look along it so it runs away from you. Fit in as much as you can.`
-          : `Stand about ${fmtM(cam.dist)} back, facing the ${esc(a.name.toLowerCase())}, and fit all of it in from end to end.`}</p>
+          ? `Stand at the house end, just beside ${what}, and look along it so it runs away from you. Fit in as much as you can.`
+          : `Stand about ${fmtM(cam.dist)} back, facing ${what}, and fit it in from end to end.`}${sh.count > 1 ? ` Sections are counted from the ${bounds(sh.area.poly).h >= bounds(sh.area.poly).w ? "house end" : "left"}.` : ""}</p>
         <p class="muted" style="margin:0">Hold the phone upright at chest height, the same way each time, so the seasons line up.</p>
-        <button class="btn dark onboard-btn" id="g-photo">${shot ? "Retake photo ✓" : "Take photo"}</button>
-        <button class="btn ghost" id="g-skip">${photoIndex === areas.length - 1 ? (shot || Object.keys(work.photos).length ? "Finish" : "Skip") : "Skip this one"}</button>`;
+        <button class="btn dark onboard-btn" id="g-photo">${taken ? "Retake photo ✓" : "Take photo"}</button>
+        <button class="btn ghost" id="g-skip">${photoIndex === shots.length - 1 ? (taken || Object.keys(work.photos).length ? "Finish" : "Skip") : "Skip this one"}</button>`;
       panel.querySelector("#g-back").addEventListener("click", () => { if (photoIndex > 0) photoIndex -= 1; else step = "areas"; render(); });
       panel.querySelector("#g-photo").addEventListener("click", async () => {
         const blob = await pickPhoto();
         if (!blob) return;
-        work.photos[a.id] = blob;
+        work.photos[sh.key] = blob;
         next();
       });
       panel.querySelector("#g-skip").addEventListener("click", next);
     };
-    const next = () => { if (photoIndex < work.plan.areas.length - 1) { photoIndex += 1; render(); } else finish(); };
+    const next = () => { if (photoIndex < shotsFor(work.plan).length - 1) { photoIndex += 1; render(); } else finish(); };
 
     const finish = async () => {
       const hasPhotos = Object.keys(work.photos).length > 0;
@@ -1849,33 +1872,43 @@ function runGuidedWalk({ garden = null } = {}) {
       try {
         const g = garden || { version: 2, settings: { gardenName: "My garden", region: "UK", hardiness: 4, soil: "unknown", aspect: "S", aspectConfirmed: false }, startSpotId: null, species: {}, spots: [], placements: [], backdrop: {} };
         g.plan = work.plan;
-        for (const a of work.plan.areas) {
-          let spot = g.spots.find((sp) => sp.planAreaId === a.id);
-          const blob = work.photos[a.id];
-          if (spot) spot.name = a.name;
+        work.plan.areas.forEach((a) => delete a.spotId);
+        const shots = shotsFor(work.plan);
+        for (const sh of shots) {
+          let spot = shotSpot(g, sh);
+          const blob = work.photos[sh.key];
+          if (spot) { spot.name = sh.name; spot.areas[0].name = sh.name; }
           if (!blob) continue;
           const takenOn = await photoTakenOn(blob);
           if (spot) await replaceSpotPhoto(spot, blob, takenOn);
           else {
             const id = uid("spot");
             await putBlob(`photo:${id}`, await resizeBlob(blob, 1600, 0.86));
-            spot = newSpot(id, a.name, `photo:${id}`);
-            spot.planAreaId = a.id;
+            spot = newSpot(id, sh.name, `photo:${id}`);
+            spot.planAreaId = sh.area.id;
+            spot.planSection = sh.index;
             spot.photoDate = takenOn;
-            Object.assign(spot.areas[0], { name: a.name, note: `About ${describeSize(a.poly)} on your plan. Set its light and moisture so ideas fit.` });
+            Object.assign(spot.areas[0], { name: sh.name, note: `About ${describeSize(sh.poly)} on your plan. Set its light and moisture so ideas fit.` });
             g.spots.push(spot);
           }
-          a.spotId = spot.id;
         }
-        // Path markers between the areas' photos, placed by where each area lies from where you stood.
-        const withSpots = work.plan.areas.map((a) => ({ a, spot: g.spots.find((sp) => sp.planAreaId === a.id) })).filter((x) => x.spot);
-        for (const { a, spot } of withSpots) {
-          const cam = cameraFor(work.plan, a);
-          for (const { a: b, spot: to } of withSpots) {
-            if (to === spot || spot.links.some((l) => l.to === to.id)) continue;
-            const pos = linkSpot(cam, centroid(b.poly));
-            while (spot.links.some((l) => Math.abs(l.x - pos.x) < 0.1 && Math.abs(l.y - pos.y) < 0.06)) pos.y -= 0.08;
-            spot.links.push({ id: uid("link"), x: +pos.x.toFixed(3), y: +pos.y.toFixed(3), to: to.id, label: b.name });
+        // Path markers: to the next and previous section of the same border, and to the nearest
+        // part of every other area, placed by where it lies from where you stood.
+        const withSpots = shots.map((sh) => ({ sh, spot: shotSpot(g, sh), c: centroid(sh.poly) })).filter((x) => x.spot);
+        for (const from of withSpots) {
+          const cam = cameraFor(work.plan, from.sh);
+          const targets = [];
+          for (const to of withSpots) {
+            if (to === from) continue;
+            if (to.sh.area === from.sh.area) { if (Math.abs(to.sh.index - from.sh.index) === 1) targets.push({ to, label: `${to.sh.index > from.sh.index ? "Next" : "Previous"} section (${to.sh.index + 1} of ${to.sh.count})` }); continue; }
+            const nearest = withSpots.filter((x) => x.sh.area === to.sh.area).sort((p, q) => Math.hypot(p.c[0] - from.c[0], p.c[1] - from.c[1]) - Math.hypot(q.c[0] - from.c[0], q.c[1] - from.c[1]))[0];
+            if (nearest === to) targets.push({ to, label: to.sh.area.name });
+          }
+          for (const { to, label } of targets) {
+            if (from.spot.links.some((l) => l.to === to.spot.id)) continue;
+            const pos = linkSpot(cam, to.c);
+            while (from.spot.links.some((l) => Math.abs(l.x - pos.x) < 0.1 && Math.abs(l.y - pos.y) < 0.06)) pos.y -= 0.08;
+            from.spot.links.push({ id: uid("link"), x: +pos.x.toFixed(3), y: +pos.y.toFixed(3), to: to.spot.id, label });
           }
         }
         if (!g.spots.length) throw new Error("No photos were saved");
@@ -1885,7 +1918,7 @@ function runGuidedWalk({ garden = null } = {}) {
       } catch (error) {
         console.error(error);
         toast(`Couldn't save the walk: ${error.message}`, 6000);
-        step = "photo"; photoIndex = Math.max(0, work.plan.areas.length - 1); render();
+        step = "photo"; photoIndex = Math.max(0, shotsFor(work.plan).length - 1); render();
       }
     };
 
@@ -2193,9 +2226,8 @@ function bindEvents() {
     if (g) { state = g; save(); ui.spotId = state.startSpotId; switchView("walk"); toast("Plan and photos saved. Earlier photos are kept for comparison."); }
   });
   $("#plan-figure").addEventListener("click", (e) => {
-    const id = e.target.closest("[data-area]")?.dataset.area;
-    const a = state.plan?.areas.find((x) => x.id === id);
-    if (a?.spotId && state.spots.some((s) => s.id === a.spotId)) { ui.spotId = a.spotId; persistUi(); switchView("walk"); }
+    const spot = planTapSpot(e.target);
+    if (spot) { ui.spotId = spot.id; persistUi(); switchView("walk"); }
   });
   $("#plan-edit-btn").addEventListener("click", () => $("#guided-btn").click());
   $("#views-list").addEventListener("click", (e) => {

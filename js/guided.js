@@ -1,5 +1,6 @@
 // Guided photo walk, plan first: sketch the garden's shape with real measurements,
-// mark the areas you'll photograph, then take one photo per area.
+// mark the areas you'll photograph, then photograph each one. Borders are photographed
+// in 2–3 m sections so each photo shows the plants up close.
 // Plan coordinates are metres: x to the right, y away from the house (house along y = 0).
 
 const AREA_COLOURS = ["#5d7650", "#c46f4c", "#5f87a8", "#b8913a", "#8a6a9a", "#4f8f86"];
@@ -81,7 +82,7 @@ export function presetArea(plan, kind) {
   switch (kind) {
     case "left": return { name: "Left border", poly: rect(b.x0, b.y0 + 0.5, b.x0 + bw, b.y1 - back) };
     case "right": return { name: "Right border", poly: rect(b.x1 - bw, b.y0 + 0.5, b.x1, b.y1 - back) };
-    case "back": return { name: "Back of the garden", poly: rect(b.x0, b.y1 - back, b.x1, b.y1) };
+    case "back": return { name: "Back border", poly: rect(b.x0, b.y1 - back, b.x1, b.y1) };
     case "middle": return { name: "Lawn", poly: rect(b.x0 + bw + 0.3, b.y0 + 1, b.x1 - bw - 0.3, b.y1 - back - 0.3) };
     default: {
       const [cx, cy] = centroid(plan.outline);
@@ -90,13 +91,57 @@ export function presetArea(plan, kind) {
   }
 }
 
+/* ---------- sections: borders photographed 2–3 m at a time ---------- */
+const SECTION_MAX = 3;
+const BORDER_WORDS = /border|bed|hedge|fence|edge/i;
+export function isSectioned(area) {
+  if (typeof area.sections === "boolean") return area.sections;
+  return BORDER_WORDS.test(area.name || "");
+}
+// Keep the part of a polygon between lo and hi along one axis (0 = x, 1 = y).
+function clipSlab(poly, axis, lo, hi) {
+  const clip = (pts, keep, edge) => {
+    const out = [];
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i], b = pts[(i + 1) % pts.length];
+      const ina = keep(a[axis]), inb = keep(b[axis]);
+      if (ina) out.push(a);
+      if (ina !== inb) {
+        const t = (edge - a[axis]) / (b[axis] - a[axis]);
+        out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+      }
+    }
+    return out;
+  };
+  return clip(clip(poly, (v) => v >= lo - 1e-9, lo), (v) => v <= hi + 1e-9, hi);
+}
+// The photos to take of an area: one, or a run of 2–3 m sections along its length,
+// numbered from the house end (or from the left, for a border across the garden).
+export function shotsOf(area) {
+  const b = bounds(area.poly);
+  const axis = b.h >= b.w ? 1 : 0;
+  const L = axis ? b.h : b.w;
+  const n = isSectioned(area) ? Math.max(1, Math.ceil(L / SECTION_MAX - 1e-6)) : 1;
+  if (n === 1) return [{ key: area.id, area, index: null, count: 1, poly: area.poly, length: L, name: area.name }];
+  const start = axis ? b.y0 : b.x0, step = L / n;
+  return Array.from({ length: n }, (_, i) => ({
+    key: `${area.id}#${i}`, area, index: i, count: n, length: step,
+    poly: clipSlab(area.poly, axis, start + step * i, start + step * (i + 1)),
+    name: `${area.name} · ${i + 1} of ${n}`
+  })).filter((s) => s.poly.length >= 3);
+}
+export const shotsFor = (plan) => plan.areas.flatMap(shotsOf);
+export const sectionCount = (area) => shotsOf(area).length;
+
 // Where to stand to photograph an area. Usually back from it towards the middle of the garden,
 // facing it. A long border that won't fit in from there is shot along its length from the house end.
 const HALF_FOV = (65 / 2) * (Math.PI / 180);
 export function cameraFor(plan, area) {
   const c = centroid(area.poly);
   const g = centroid(plan.outline);
-  const others = plan.areas.filter((a) => a !== area && a.id !== area.id);
+  const ownId = area.area?.id || area.id;
+  // You can stand on a lawn or patio, but not in another border.
+  const others = plan.areas.filter((a) => a.id !== ownId && isSectioned(a));
   const free = (x, y) => inside(x, y, plan.outline) && !inside(x, y, area.poly) && !others.some((o) => inside(x, y, o.poly));
   const ab = bounds(area.poly);
   let dx = g[0] - c[0], dy = g[1] - c[1];
@@ -150,7 +195,7 @@ export function viewBoxFor(plan, pad = 0.18) {
 }
 
 // k = metres per screen pixel, so handles and text stay a constant size on screen.
-export function planSvgInner(plan, { k = 0.05, mode = "view", selected = null, highlight = null, camera = null } = {}) {
+export function planSvgInner(plan, { k = 0.05, mode = "view", selected = null, highlight = null, camera = null, shot = null } = {}) {
   const ob = bounds(plan.outline);
   const font = 12 * k;
   const out = [];
@@ -162,10 +207,21 @@ export function planSvgInner(plan, { k = 0.05, mode = "view", selected = null, h
     const isSel = selected === a.id, isHi = highlight === a.id;
     const dim = highlight && !isHi;
     out.push(`<polygon points="${pts2(a.poly)}" fill="${col}" fill-opacity="${dim ? 0.12 : isSel || isHi ? 0.42 : 0.28}" stroke="${col}" stroke-opacity="${dim ? 0.35 : 1}" stroke-width="${(isSel || isHi ? 2.6 : 1.6) * k}" stroke-dasharray="${isSel ? `${6 * k} ${4 * k}` : "none"}" data-area="${a.id}"/>`);
-    if ((isSel && mode === "areas") || dim) return;
+    const shots = shotsOf(a);
+    if (shots.length > 1) {
+      // Section dividers; in the plan card each section can be tapped to open its view.
+      shots.forEach((sh) => {
+        out.push(`<polygon points="${pts2(sh.poly)}" fill="${mode === "view" && !highlight ? "transparent" : "none"}" stroke="#fbf8f1" stroke-opacity="${dim ? 0.5 : 0.9}" stroke-width="${1.6 * k}" stroke-dasharray="${4 * k} ${3 * k}" ${mode === "view" && !highlight ? `data-shot="${sh.key}"` : 'pointer-events="none"'}/>`);
+      });
+    }
+    if ((isSel && mode === "areas") || dim || (shot && shots.length > 1)) return;
     const [cx, cy] = S(centroid(a.poly));
-    out.push(`<text x="${cx}" y="${cy + font * 0.35}" font-size="${font}" font-weight="700" text-anchor="middle" fill="#2a2b23" opacity="${dim ? 0.45 : 1}" pointer-events="none" style="paint-order:stroke" stroke="#fbf8f1" stroke-width="${3 * k}">${escXml(a.name)}</text>`);
+    // Names run along tall, narrow areas so they fit.
+    const ab = bounds(a.poly);
+    const rot = ab.h > ab.w * 1.8 && ab.w < 2.5 ? ` transform="rotate(-90 ${cx} ${cy})"` : "";
+    out.push(`<text${rot} x="${cx}" y="${cy + font * 0.35}" font-size="${font}" font-weight="700" text-anchor="middle" fill="#2a2b23" opacity="${dim ? 0.45 : 1}" pointer-events="none" style="paint-order:stroke" stroke="#fbf8f1" stroke-width="${3 * k}">${escXml(a.name)}</text>`);
   });
+  if (shot) out.push(`<polygon points="${pts2(shot.poly)}" fill="#c46f4c" fill-opacity=".45" stroke="#c46f4c" stroke-width="${2.8 * k}" pointer-events="none"/>`);
   // Side lengths: on the garden while shaping it, on the selected area while marking areas.
   const sideOf = mode === "shape" ? plan.outline : mode === "areas" && selected ? plan.areas.find((a) => a.id === selected)?.poly : mode === "view" && !highlight ? plan.outline : null;
   if (sideOf) out.push(sideLabels(sideOf, k, mode !== "view"));
@@ -238,7 +294,7 @@ export function planSvg(plan, opts = {}, attrs = "") {
 /* ---------- interactive editor ---------- */
 // mode "shape": drag corners of the garden, tap + to add a corner, tap a side's length to type it.
 // mode "areas": tap an area to select it, then drag its corners the same way.
-export function mountPlanEditor(svg, plan, { mode, onSelect = () => {}, onSide = () => {}, onCorner = () => {}, onChange = () => {} }) {
+export function mountPlanEditor(svg, plan, { mode, onSelect = () => {}, onSide = () => {}, onCorner = () => {}, onChange = () => {}, onCommit = () => {} }) {
   let selected = null;
   let vb = viewBoxFor(plan);
   let drag = null;
@@ -301,6 +357,7 @@ export function mountPlanEditor(svg, plan, { mode, onSelect = () => {}, onSide =
     if (d.start && !d.moved) { onCorner(d.i); return; }
     vb = viewBoxFor(plan);
     render();
+    onCommit();
   };
   svg.addEventListener("pointerup", end);
   svg.addEventListener("pointercancel", end);
@@ -311,4 +368,194 @@ export function mountPlanEditor(svg, plan, { mode, onSelect = () => {}, onSide =
     get selected() { return selected; },
     target
   };
+}
+
+/* ---------- keeping areas tidy: inside the garden, never overlapping ----------
+   Areas are trimmed on a fine grid (5 cm), then the result is traced back into a polygon,
+   straightened, and snapped onto the original corners so edges stay exact. */
+const MIN_PIECE = 0.3;   // m²: smaller leftovers are dropped
+const MIN_CHANGE = 0.03; // m²: overlaps smaller than this are ignored
+const MIN_SPLIT = 2;     // m²: a cut-off piece must be at least this big to become its own area
+
+function trimPoly(poly, outline, blockers) {
+  const b = bounds(poly);
+  let cell = 0.05;
+  while (((b.w / cell) * (b.h / cell)) > 400000) cell *= 1.5;
+  const x0 = Math.floor(b.x0 / cell) * cell - cell, y0 = Math.floor(b.y0 / cell) * cell - cell;
+  const nx = Math.ceil((b.x1 - x0) / cell) + 2, ny = Math.ceil((b.y1 - y0) / cell) + 2;
+  const live = blockers.filter((q) => { const qb = bounds(q); return qb.x1 > b.x0 && qb.x0 < b.x1 && qb.y1 > b.y0 && qb.y0 < b.y1; });
+  const grid = new Uint8Array(nx * ny);
+  let inA = 0, kept = 0;
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const cx = x0 + (i + 0.5) * cell, cy = y0 + (j + 0.5) * cell;
+    if (!inside(cx, cy, poly)) continue;
+    inA++;
+    if (inside(cx, cy, outline) && !live.some((q) => inside(cx, cy, q))) { grid[j * nx + i] = 1; kept++; }
+  }
+  if ((inA - kept) * cell * cell < MIN_CHANGE) return null; // nothing worth changing
+  const snapTo = [poly, outline, ...live].flat();
+  const pieces = [];
+  for (const comp of components(grid, nx, ny)) {
+    if (comp.count * cell * cell < MIN_PIECE) continue;
+    carveHoles(comp.mask, nx, ny, b.w < b.h ? 0 : 1);
+    for (const part of components(comp.mask, nx, ny)) {
+      if (part.count * cell * cell < MIN_PIECE) continue;
+      const loop = traceOuter(part.mask, nx, ny);
+      if (!loop) continue;
+      const pts = tidy(simplifyClosed(loop.map(([i, j]) => [x0 + i * cell, y0 + j * cell]), cell * 1.3), snapTo, cell * 1.8);
+      if (pts.length >= 3 && Math.abs(signedArea(pts)) >= MIN_PIECE) pieces.push(pts);
+    }
+  }
+  pieces.sort((p, q) => Math.abs(signedArea(q)) - Math.abs(signedArea(p)));
+  return pieces;
+}
+
+function components(grid, nx, ny) {
+  const seen = new Uint8Array(nx * ny), out = [];
+  for (let s = 0; s < grid.length; s++) {
+    if (!grid[s] || seen[s]) continue;
+    const mask = new Uint8Array(nx * ny), stack = [s];
+    let count = 0;
+    seen[s] = 1;
+    while (stack.length) {
+      const c = stack.pop(); mask[c] = 1; count++;
+      const i = c % nx, j = (c - i) / nx;
+      for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const a = i + di, bb = j + dj;
+        if (a < 0 || bb < 0 || a >= nx || bb >= ny) continue;
+        const n = bb * nx + a;
+        if (grid[n] && !seen[n]) { seen[n] = 1; stack.push(n); }
+      }
+    }
+    out.push({ mask, count });
+  }
+  return out.sort((p, q) => q.count - p.count);
+}
+
+// An area entirely inside another would leave a hole; cut a notch from the hole to the
+// nearest edge instead, across the area's narrow direction (axis 0 = left/right).
+function carveHoles(mask, nx, ny, axis) {
+  const outside = new Uint8Array(nx * ny), stack = [];
+  for (let i = 0; i < nx; i++) stack.push(i, (ny - 1) * nx + i);
+  for (let j = 0; j < ny; j++) stack.push(j * nx, j * nx + nx - 1);
+  while (stack.length) {
+    const c = stack.pop();
+    if (outside[c] || mask[c]) continue;
+    outside[c] = 1;
+    const i = c % nx, j = (c - i) / nx;
+    if (i > 0) stack.push(c - 1); if (i < nx - 1) stack.push(c + 1);
+    if (j > 0) stack.push(c - nx); if (j < ny - 1) stack.push(c + nx);
+  }
+  const holes = new Uint8Array(nx * ny);
+  let any = false;
+  for (let c = 0; c < mask.length; c++) if (!mask[c] && !outside[c]) { holes[c] = 1; any = true; }
+  if (!any) return;
+  let mi0 = nx, mi1 = 0, mj0 = ny, mj1 = 0;
+  for (let c = 0; c < mask.length; c++) if (mask[c]) { const i = c % nx, j = (c - i) / nx; mi0 = Math.min(mi0, i); mi1 = Math.max(mi1, i); mj0 = Math.min(mj0, j); mj1 = Math.max(mj1, j); }
+  for (const h of components(holes, nx, ny)) {
+    let i0 = nx, i1 = 0, j0 = ny, j1 = 0;
+    for (let c = 0; c < h.mask.length; c++) if (h.mask[c]) { const i = c % nx, j = (c - i) / nx; i0 = Math.min(i0, i); i1 = Math.max(i1, i); j0 = Math.min(j0, j); j1 = Math.max(j1, j); }
+    if (axis === 0) {
+      const toLow = i0 - mi0 <= mi1 - i1;
+      for (let j = j0; j <= j1; j++) for (let i = toLow ? mi0 : i1; i <= (toLow ? i0 : mi1); i++) mask[j * nx + i] = 0;
+    } else {
+      const toLow = j0 - mj0 <= mj1 - j1;
+      for (let i = i0; i <= i1; i++) for (let j = toLow ? mj0 : j1; j <= (toLow ? j0 : mj1); j++) mask[j * nx + i] = 0;
+    }
+  }
+}
+
+// Outer boundary of a set of cells, as corner coordinates, anticlockwise.
+function traceOuter(mask, nx, ny) {
+  const at = (i, j) => i >= 0 && j >= 0 && i < nx && j < ny && mask[j * nx + i];
+  const edges = new Map();
+  const add = (a, b) => { const k = `${a[0]},${a[1]}`; (edges.get(k) || edges.set(k, []).get(k)).push({ a, b, used: false }); };
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    if (!mask[j * nx + i]) continue;
+    if (!at(i, j - 1)) add([i, j], [i + 1, j]);
+    if (!at(i + 1, j)) add([i + 1, j], [i + 1, j + 1]);
+    if (!at(i, j + 1)) add([i + 1, j + 1], [i, j + 1]);
+    if (!at(i - 1, j)) add([i, j + 1], [i, j]);
+  }
+  let best = null, bestArea = 0;
+  for (const list of edges.values()) for (const first of list) {
+    if (first.used) continue;
+    const loop = [];
+    let e = first;
+    while (e && !e.used) {
+      e.used = true;
+      loop.push(e.a);
+      const dir = [e.b[0] - e.a[0], e.b[1] - e.a[1]];
+      const nexts = (edges.get(`${e.b[0]},${e.b[1]}`) || []).filter((x) => !x.used);
+      // At a pinch point, turn left: pieces that only touch at a corner are traced separately.
+      nexts.sort((p, q) => turn(dir, q) - turn(dir, p));
+      e = nexts[0];
+    }
+    const area = signedArea(loop);
+    if (area > bestArea) { bestArea = area; best = loop; }
+  }
+  return best;
+}
+const turn = (dir, e) => { const d = [e.b[0] - e.a[0], e.b[1] - e.a[1]]; return dir[0] * d[1] - dir[1] * d[0]; };
+
+function simplifyClosed(pts, tol) {
+  if (pts.length < 4) return pts;
+  let far = 0, fd = -1;
+  for (let i = 1; i < pts.length; i++) { const d = len(pts[0], pts[i]); if (d > fd) { fd = d; far = i; } }
+  const dp = (a) => {
+    if (a.length < 3) return a;
+    let idx = 0, md = 0;
+    for (let i = 1; i < a.length - 1; i++) { const d = segDist(a[i], a[0], a[a.length - 1]); if (d > md) { md = d; idx = i; } }
+    if (md <= tol) return [a[0], a[a.length - 1]];
+    return [...dp(a.slice(0, idx + 1)).slice(0, -1), ...dp(a.slice(idx))];
+  };
+  const one = dp(pts.slice(0, far + 1)), two = dp([...pts.slice(far), pts[0]]);
+  return [...one.slice(0, -1), ...two.slice(0, -1)];
+}
+function segDist(p, a, b) {
+  const vx = b[0] - a[0], vy = b[1] - a[1], l2 = vx * vx + vy * vy;
+  const t = l2 ? Math.max(0, Math.min(1, ((p[0] - a[0]) * vx + (p[1] - a[1]) * vy) / l2)) : 0;
+  return Math.hypot(p[0] - a[0] - vx * t, p[1] - a[1] - vy * t);
+}
+// Snap onto nearby original corners, round, drop repeats and straight-through points.
+function tidy(pts, snapTo, snap) {
+  let out = pts.map((p) => {
+    let best = null, bd = snap;
+    for (const q of snapTo) { const d = len(p, q); if (d < bd) { bd = d; best = q; } }
+    return best ? [...best] : [Math.round(p[0] * 100) / 100, Math.round(p[1] * 100) / 100];
+  });
+  out = out.filter((p, i) => len(p, out[(i + 1) % out.length]) > 0.02);
+  let changed = true;
+  while (changed && out.length > 3) {
+    changed = false;
+    for (let i = 0; i < out.length; i++) {
+      const a = out[(i - 1 + out.length) % out.length], p = out[i], c = out[(i + 1) % out.length];
+      if (segDist(p, a, c) < 0.02) { out.splice(i, 1); changed = true; break; }
+    }
+  }
+  return out;
+}
+
+// Make every area sit inside the garden without overlapping. Areas earlier in `first`
+// keep their shape; the rest are trimmed around them (in plan order).
+// Returns notes for the person, e.g. "Trimmed Back border".
+export function settleAreas(plan, first = []) {
+  const order = [...first.map((id) => plan.areas.find((a) => a.id === id)).filter(Boolean), ...plan.areas.filter((a) => !first.includes(a.id))];
+  const placed = [], notes = [], extra = [];
+  for (const a of order) {
+    const pieces = trimPoly(a.poly, plan.outline, placed.map((p) => p.poly));
+    if (pieces === null) { placed.push(a); continue; }
+    if (!pieces.length) { notes.push(`Removed ${a.name}: no room left for it`); a.dead = true; continue; }
+    a.poly = pieces[0];
+    placed.push(a);
+    notes.push(`Trimmed ${a.name} to fit`);
+    pieces.slice(1).filter((poly) => Math.abs(signedArea(poly)) >= MIN_SPLIT).forEach((poly, k) => {
+      const piece = { ...a, id: `${a.id}-${Date.now().toString(36)}${k}`, name: `${a.name} (${k + 2})`, poly, sections: a.sections };
+      delete piece.spotId;
+      extra.push(piece); placed.push(piece);
+      notes.push(`${a.name} was split in two`);
+    });
+  }
+  plan.areas = [...plan.areas.filter((a) => !a.dead), ...extra];
+  return [...new Set(notes)];
 }
