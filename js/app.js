@@ -1,4 +1,5 @@
 import { getValue, setValue, getBlob, putBlob, deleteBlobsWithPrefix, uid } from "./store.js";
+import { readablePhoto, decodePhoto } from "./photo-input.js";
 import { searchPlants, SOURCE_LABEL } from "./plant-index.js";
 import { segmentAt, pointInPoly, polyBounds } from "./segment.js";
 import { buildFirstGarden, newSpot } from "./seed.js";
@@ -7,7 +8,7 @@ import { photoTakenOn } from "./exif.js";
 import { MONTHS, MON, monthRange, nearestArea, bloomCoverage, speciesFor, recommendFor, describeConditions, fitsConditions } from "./recommend.js";
 import * as ai from "./ai.js";
 import { loadWeather, syncWeather, findPlace, monthSummary, lastDays, isoDay } from "./weather.js";
-import { newPlan, bounds, signedArea, centroid, describeSize, setSideLength, presetArea, cameraFor, linkSpot, fmtM, planSvg, mountPlanEditor, settleAreas, shotsFor, shotsOf, isSectioned, planPoint, neighbourSpotIds } from "./guided.js";
+import { newPlan, bounds, signedArea, centroid, describeSize, setSideLength, presetArea, cameraFor, linkSpot, fmtM, planSvg, mountPlanEditor, settleAreas, shotsFor, shotsOf, isSectioned, planPoint, neighbourSpotIds, mountCameraEditor } from "./guided.js";
 
 const ENGINE = "sk5";
 const WORK_SIZE = 1200;
@@ -71,15 +72,23 @@ function pickPhoto() {
     const input = $("#gallery-input");
     input.value = "";
     const done = () => { input.removeEventListener("change", onChange); window.removeEventListener("focus", onFocus); };
-    const onChange = () => { done(); resolve(input.files?.[0] || null); };
+    const onChange = async () => {
+      done();
+      const file = input.files?.[0];
+      if (!file) { resolve(null); return; }
+      // iPhone HEIC photos and some very large images can't be opened directly: convert them first.
+      try { resolve(await readablePhoto(file, () => toast("Converting photo…", 6000))); }
+      catch (error) { console.error(error); toast(error.message, 7000); resolve(null); }
+    };
     const onFocus = () => setTimeout(() => { if (!input.files?.length) { done(); resolve(null); } }, 800);
     input.addEventListener("change", onChange);
     window.addEventListener("focus", onFocus);
     input.click();
   });
 }
+
 async function resizeBlob(blob, max = 1600, quality = 0.86) {
-  const bitmap = await createImageBitmap(blob, { imageOrientation: "from-image" });
+  const bitmap = await decodePhoto(blob);
   const scale = Math.min(1, max / Math.max(bitmap.width, bitmap.height));
   const canvas = document.createElement("canvas");
   canvas.width = Math.round(bitmap.width * scale);
@@ -169,7 +178,7 @@ async function spotPixels(spot, photoId = bestPhoto(spot, ui.month).photoId) {
   if (pixelCache.has(photoId)) return pixelCache.get(photoId);
   const blob = await getBlob(photoId);
   if (!blob) throw new Error("Photo missing for this view");
-  const bitmap = await createImageBitmap(blob, { imageOrientation: "from-image" });
+  const bitmap = await decodePhoto(blob);
   const scale = Math.min(1, WORK_SIZE / Math.max(bitmap.width, bitmap.height));
   const canvas = document.createElement("canvas");
   canvas.width = Math.round(bitmap.width * scale);
@@ -896,7 +905,7 @@ function closeSheetKeepDraft() {
 // Crop the outlined area (with a margin) from the full-resolution photo, for identification.
 async function cropFromView(spot, poly) {
   const blob = await getBlob(spot.photoId);
-  const bitmap = await createImageBitmap(blob, { imageOrientation: "from-image" });
+  const bitmap = await decodePhoto(blob);
   const b = poly?.length ? polyBounds(poly) : { x0: 0, y0: 0, x1: 1, y1: 1 };
   const padX = (b.x1 - b.x0) * 0.15 + 0.02, padY = (b.y1 - b.y0) * 0.15 + 0.02;
   const x0 = Math.max(0, b.x0 - padX) * bitmap.width, y0 = Math.max(0, b.y0 - padY) * bitmap.height;
@@ -1903,7 +1912,15 @@ function runGuidedWalk({ garden = null } = {}) {
   return new Promise((resolve) => {
     const panel = $("#guide");
     const plan = garden?.plan ? JSON.parse(JSON.stringify(garden.plan)) : null;
-    const work = { plan, photos: {}, views: { shape: {}, areas: {} } };
+    const work = { plan, photos: {}, dates: {}, views: { shape: {}, areas: {} } };
+    // The walk saves as you go: plan, step and photos, so you can stop and carry on later.
+    const DRAFT = "walkDraft", DRAFT_BLOBS = "walkdraft:";
+    let draftTimer = null;
+    const saveDraft = () => {
+      clearTimeout(draftTimer);
+      draftTimer = setTimeout(() => setValue(DRAFT, { plan: work.plan, step, photoIndex, dates: work.dates, photoKeys: Object.keys(work.photos), forGarden: !!garden, savedAt: new Date().toISOString() }).catch(() => {}), 300);
+    };
+    const clearDraft = async () => { clearTimeout(draftTimer); await setValue(DRAFT, null).catch(() => {}); await deleteBlobsWithPrefix(DRAFT_BLOBS).catch(() => {}); };
     const bindZoom = (editor) => panel.querySelectorAll("[data-z]").forEach((btn) => btn.addEventListener("click", () => {
       const z = btn.dataset.z;
       if (z === "fit") editor.fit(); else editor.zoomBy(z === "in" ? 1.6 : 1 / 1.6);
@@ -1913,13 +1930,18 @@ function runGuidedWalk({ garden = null } = {}) {
     document.body.classList.add("guiding");
     panel.hidden = false;
     const close = (result) => { panel.hidden = true; panel.innerHTML = ""; document.body.classList.remove("guiding"); resolve(result); };
+    const closeForLater = () => {
+      const started = work.plan && (step !== "size" || Object.keys(work.photos).length);
+      if (started) { saveDraft(); toast("Saved. Carry on any time from the guided photo walk."); }
+      close(null);
+    };
     const dots = () => {
       const all = ["size", "shape", "areas", ...(work.plan ? shotsFor(work.plan) : []).map((_, k) => `photo${k}`)];
       const now = step === "photo" ? `photo${photoIndex}` : step;
       const at = all.indexOf(now);
       return `<div class="guide-dots">${all.map((_, k) => `<i class="${k < at ? "done" : k === at ? "now" : ""}"></i>`).join("")}</div>`;
     };
-    const top = (backLabel) => `<div class="guide-top"><button class="btn small ghost" id="g-back">${backLabel}</button>${dots()}</div>`;
+    const top = (backLabel) => `<div class="guide-top"><button class="btn small ghost" id="g-back">${backLabel}</button>${dots()}<button class="btn small ghost" id="g-close" aria-label="Save and close">Save</button></div>`;
     const num = (v) => { const n = parseFloat(String(v).replace(",", ".")); return Number.isFinite(n) && n > 0 ? n : null; };
     // Areas always sit inside the garden without overlapping: `keep` holds its shape, others give way.
     const settle = (keep = []) => { const notes = settleAreas(work.plan, keep); if (notes.length) toast(notes.join(" · ")); };
@@ -1951,7 +1973,7 @@ function runGuidedWalk({ garden = null } = {}) {
         </div>
         <p class="muted" style="margin:0">Pace it out if you don't have a tape: one big stride is about a metre.</p>
         <button class="btn dark onboard-btn" id="g-next">Next: the shape</button>`;
-      panel.querySelector("#g-back").addEventListener("click", () => close(null));
+      panel.querySelector("#g-back").addEventListener("click", closeForLater);
       panel.querySelector("#g-next").addEventListener("click", () => {
         const w = num(panel.querySelector("#g-w").value), l = num(panel.querySelector("#g-l").value);
         if (!w || !l || w > 500 || l > 500) { toast("Enter the width and length in metres"); return; }
@@ -2060,26 +2082,47 @@ function runGuidedWalk({ garden = null } = {}) {
 
     const renderPhoto = () => {
       const shots = shotsFor(work.plan);
+      photoIndex = Math.min(photoIndex, shots.length - 1);
       const sh = shots[photoIndex];
       const cam = cameraFor(work.plan, sh);
       const existing = shotSpot(garden, sh);
       const taken = work.photos[sh.key];
       const what = sh.count > 1 ? `this ${fmtM(sh.length)} section` : `the ${esc(sh.area.name.toLowerCase())}`;
+      const hint = cam.custom
+        ? `Stand where you've put the dot, about ${fmtM(cam.dist)} from ${what}, facing the way the arrow points.`
+        : cam.along
+          ? `Stand at the house end, just beside ${what}, and look along it so it runs away from you. Fit in as much as you can.`
+          : `Stand about ${fmtM(cam.dist)} back, facing ${what}, and fit it in from end to end.${sh.count > 1 ? ` Sections are counted from the ${bounds(sh.area.poly).h >= bounds(sh.area.poly).w ? "house end" : "left"}.` : ""}`;
+      const planOpts = { highlight: sh.area.id, shot: sh.count > 1 ? sh : null };
       panel.innerHTML = `${top("Back")}
         <p class="eyebrow">Photo ${photoIndex + 1} of ${shots.length}${existing ? " · retake for this season" : ""}</p>
         <h1>${esc(sh.area.name)}${sh.count > 1 ? ` <em>${sh.index + 1} of ${sh.count}</em>` : ""}</h1>
-        ${planSvg(work.plan, { highlight: sh.area.id, shot: sh.count > 1 ? sh : null, camera: cam, widthPx: Math.min(440, window.innerWidth - 48), heightPx: window.innerHeight * 0.34 }, 'class="plan-svg guide-plan" role="img" aria-label="Plan showing what to photograph and where to stand"')}
-        <p class="lede">${cam.along
-          ? `Stand at the house end, just beside ${what}, and look along it so it runs away from you. Fit in as much as you can.`
-          : `Stand about ${fmtM(cam.dist)} back, facing ${what}, and fit it in from end to end.`}${sh.count > 1 ? ` Sections are counted from the ${bounds(sh.area.poly).h >= bounds(sh.area.poly).w ? "house end" : "left"}.` : ""}</p>
+        ${planSvg(work.plan, { ...planOpts, camera: cam, editCamera: true, widthPx: Math.min(440, window.innerWidth - 48), heightPx: window.innerHeight * 0.34 }, 'class="plan-svg guide-plan cam-edit" role="img" aria-label="Plan showing what to photograph and where to stand"')}
+        <p class="muted" style="margin:0;font-size:12.5px">Drag the dot to stand somewhere else, or the round handle to turn.${cam.custom ? ` <button class="linkish" id="g-cam-reset">Back to the suggested spot</button>` : ""}</p>
+        <p class="lede">${hint}</p>
         <p class="muted" style="margin:0">Hold the phone upright at chest height, the same way each time, so the seasons line up.</p>
         <button class="btn dark onboard-btn" id="g-photo">${taken ? "Retake photo ✓" : "Take photo"}</button>
         <button class="btn ghost" id="g-skip">${photoIndex === shots.length - 1 ? (taken || Object.keys(work.photos).length ? "Finish" : "Skip") : "Skip this one"}</button>`;
+      mountCameraEditor(panel.querySelector(".cam-edit"), work.plan, sh, planOpts, () => { saveDraft(); renderPhoto(); });
+      panel.querySelector("#g-cam-reset")?.addEventListener("click", () => { delete work.plan.cams[sh.key]; saveDraft(); renderPhoto(); });
       panel.querySelector("#g-back").addEventListener("click", () => { if (photoIndex > 0) photoIndex -= 1; else step = "areas"; render(); });
+      panel.querySelector("#g-close").addEventListener("click", closeForLater);
       panel.querySelector("#g-photo").addEventListener("click", async () => {
         const blob = await pickPhoto();
         if (!blob) return;
-        work.photos[sh.key] = blob;
+        const btn = panel.querySelector("#g-photo");
+        if (btn) { btn.disabled = true; btn.textContent = "Saving photo…"; }
+        try {
+          work.dates[sh.key] = await photoTakenOn(blob);
+          const small = await resizeBlob(blob, 1600, 0.86);
+          work.photos[sh.key] = small;
+          await putBlob(DRAFT_BLOBS + sh.key, small);
+        } catch (error) {
+          console.error(error);
+          toast(`Couldn't use that photo: ${error.message}`, 6000);
+          renderPhoto();
+          return;
+        }
         next();
       });
       panel.querySelector("#g-skip").addEventListener("click", next);
@@ -2100,7 +2143,7 @@ function runGuidedWalk({ garden = null } = {}) {
           const blob = work.photos[sh.key];
           if (spot) { spot.name = sh.name; spot.areas[0].name = sh.name; }
           if (!blob) continue;
-          const takenOn = await photoTakenOn(blob);
+          const takenOn = work.dates[sh.key] || await photoTakenOn(blob);
           if (spot) await replaceSpotPhoto(spot, blob, takenOn);
           else {
             const id = uid("spot");
@@ -2135,6 +2178,7 @@ function runGuidedWalk({ garden = null } = {}) {
         if (!g.spots.length) throw new Error("No photos were saved");
         if (!g.spots.some((sp) => sp.id === g.startSpotId)) g.startSpotId = (withSpots[0]?.spot || g.spots[0]).id;
         await setValue("state", g);
+        await clearDraft();
         close(g);
       } catch (error) {
         console.error(error);
@@ -2146,8 +2190,36 @@ function runGuidedWalk({ garden = null } = {}) {
     const render = () => {
       panel.scrollTop = 0; window.scrollTo(0, 0);
       ({ size: renderSize, shape: renderShape, areas: renderAreas, photo: renderPhoto })[step]();
+      panel.querySelector("#g-close")?.addEventListener("click", closeForLater);
+      if (work.plan) saveDraft();
     };
-    render();
+    // Offer to carry on from a saved draft.
+    (async () => {
+      const draft = await getValue(DRAFT).catch(() => null);
+      if (!draft?.plan || draft.forGarden !== !!garden) { render(); return; }
+      const n = draft.photoKeys?.length || 0;
+      const when = new Date(draft.savedAt).toLocaleString("en-GB", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+      panel.innerHTML = `<div class="guide-top"><button class="btn small ghost" id="g-back">${garden ? "Cancel" : "Back"}</button></div>
+        <p class="eyebrow">Guided photo walk</p>
+        <h1>Carry on where <em>you left off?</em></h1>
+        <p class="lede">You have a saved garden plan from ${esc(when)}, with ${draft.plan.areas.length} area${draft.plan.areas.length === 1 ? "" : "s"}${n ? ` and ${n} photo${n === 1 ? "" : "s"} taken` : ""}.</p>
+        ${planSvg(draft.plan, { widthPx: Math.min(440, window.innerWidth - 48), heightPx: window.innerHeight * 0.34 }, 'class="plan-svg guide-plan" role="img" aria-label="Your saved plan"')}
+        <button class="btn dark onboard-btn" id="g-resume">Carry on</button>
+        <button class="btn ghost" id="g-fresh">Start again</button>`;
+      panel.querySelector("#g-back").addEventListener("click", () => close(null));
+      panel.querySelector("#g-fresh").addEventListener("click", async () => { await clearDraft(); render(); });
+      panel.querySelector("#g-resume").addEventListener("click", async () => {
+        work.plan = draft.plan;
+        work.dates = draft.dates || {};
+        for (const key of draft.photoKeys || []) {
+          const blob = await getBlob(DRAFT_BLOBS + key).catch(() => null);
+          if (blob) work.photos[key] = blob;
+        }
+        step = draft.step || "areas";
+        photoIndex = draft.photoIndex || 0;
+        render();
+      });
+    })();
   });
 }
 

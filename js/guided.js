@@ -141,6 +141,12 @@ export const sectionCount = (area) => shotsOf(area).length;
 const HALF_FOV = (65 / 2) * (Math.PI / 180);
 export function cameraFor(plan, area) {
   const c = centroid(area.poly);
+  // Where you chose to stand instead, if you moved it.
+  const own = plan.cams?.[area.key || area.id];
+  if (own) {
+    const l = Math.hypot(own.dir[0], own.dir[1]) || 1;
+    return { x: own.x, y: own.y, dir: [own.dir[0] / l, own.dir[1] / l], dist: Math.hypot(c[0] - own.x, c[1] - own.y), along: false, custom: true };
+  }
   const g = centroid(plan.outline);
   const ownId = area.area?.id || area.id;
   // You can stand on a lawn or patio, but not in another border.
@@ -202,7 +208,7 @@ export function viewBoxFor(plan, pad = 0.18) {
 }
 
 // k = metres per screen pixel, so handles and text stay a constant size on screen.
-export function planSvgInner(plan, { k = 0.05, mode = "view", selected = null, highlight = null, camera = null, shot = null, dots = null } = {}) {
+export function planSvgInner(plan, { k = 0.05, mode = "view", selected = null, highlight = null, camera = null, shot = null, dots = null, editCamera = false } = {}) {
   const ob = bounds(plan.outline);
   const font = 12 * k;
   const out = [];
@@ -250,7 +256,13 @@ export function planSvgInner(plan, { k = 0.05, mode = "view", selected = null, h
     const p2 = [x + Math.cos(ang + spread) * L, y + Math.sin(ang + spread) * L];
     out.push(`<clipPath id="plan-clip"><polygon points="${pts2(plan.outline)}"/></clipPath>`);
     out.push(`<polygon clip-path="url(#plan-clip)" points="${x},${y} ${p1.join(",")} ${p2.join(",")}" fill="rgba(196,111,76,.25)" stroke="#c46f4c" stroke-width="${1.4 * k}"/>`);
-    out.push(`<circle cx="${x}" cy="${y}" r="${9 * k}" fill="#2a2b23"/><circle cx="${x}" cy="${y}" r="${3.5 * k}" fill="#fbf8f1"/>`);
+    if (editCamera) {
+      // A handle at the end of the view to turn it.
+      const hx = x + Math.cos(ang) * L * 0.8, hy = y + Math.sin(ang) * L * 0.8;
+      out.push(`<line x1="${x}" y1="${y}" x2="${hx}" y2="${hy}" stroke="#c46f4c" stroke-width="${2 * k}" stroke-dasharray="${4 * k} ${3 * k}"/>`);
+      out.push(`<g data-aim="1" style="cursor:grab"><circle cx="${hx}" cy="${hy}" r="${20 * k}" fill="transparent"/><circle cx="${hx}" cy="${hy}" r="${9 * k}" fill="#fffdf8" stroke="#c46f4c" stroke-width="${2.4 * k}"/><path d="M${hx - 4 * k} ${hy - 2 * k}a${4.5 * k} ${4.5 * k} 0 1 1 ${1 * k} ${5 * k}" fill="none" stroke="#c46f4c" stroke-width="${1.6 * k}"/></g>`);
+    }
+    out.push(`<g ${editCamera ? 'data-cam="1" style="cursor:grab"' : ""}><circle cx="${x}" cy="${y}" r="${22 * k}" fill="transparent"/><circle cx="${x}" cy="${y}" r="${9 * k}" fill="#2a2b23"/><circle cx="${x}" cy="${y}" r="${3.5 * k}" fill="#fbf8f1"/></g>`);
     // Label on the side away from where you're looking.
     const left = camera.dir[0] > 0.2;
     out.push(`<text x="${x + (left ? -14 : 14) * k}" y="${y + font * 0.35}" font-size="${font}" text-anchor="${left ? "end" : "start"}" font-weight="700" fill="#2a2b23" style="paint-order:stroke" stroke="#fbf8f1" stroke-width="${3 * k}">Stand here</text>`);
@@ -300,7 +312,7 @@ function escXml(s) {
 export function planSvg(plan, opts = {}, attrs = "") {
   const vb = viewBoxFor(plan);
   const k = Math.max(vb.w / (opts.widthPx || 340), opts.heightPx ? vb.h / opts.heightPx : 0);
-  return `<svg viewBox="${vb.x} ${vb.y} ${vb.w} ${vb.h}" class="plan-svg" font-family="DM Sans, sans-serif" ${attrs}>${planSvgInner(plan, { ...opts, k })}</svg>`;
+  return `<svg viewBox="${vb.x} ${vb.y} ${vb.w} ${vb.h}" ${/\bclass=/.test(attrs) ? "" : 'class="plan-svg"'} font-family="DM Sans, sans-serif" ${attrs}>${planSvgInner(plan, { ...opts, k })}</svg>`;
 }
 
 /* ---------- interactive editor ---------- */
@@ -703,4 +715,47 @@ export function neighbourSpotIds(plan, spot, spots) {
     const gy = Math.max(0, Math.max(a.y0, b.y0) - Math.min(a.y1, b.y1));
     return Math.hypot(gx, gy) <= 0.6;
   }).map((s) => s.id);
+}
+
+/* ---------- choosing where to stand for a photo ----------
+   Drag the dot to stand somewhere else (it keeps facing what you're photographing), drag the
+   round handle to turn, or tap anywhere in the garden to stand there. Saved in plan.cams. */
+export function mountCameraEditor(svg, plan, shot, opts, onCommit = () => {}) {
+  const key = shot.key || shot.id;
+  const target = centroid(shot.poly);
+  let drag = null;
+  const vbOf = () => svg.viewBox.baseVal;
+  const k = () => { const v = vbOf(); return Math.max(v.width / Math.max(1, svg.clientWidth), v.height / Math.max(1, svg.clientHeight)); };
+  const render = () => { svg.innerHTML = planSvgInner(plan, { ...opts, k: k(), camera: cameraFor(plan, shot), editCamera: true }); };
+  const toPlan = (ev) => {
+    const pt = svg.createSVGPoint();
+    pt.x = ev.clientX; pt.y = ev.clientY;
+    const p = pt.matrixTransform(svg.getScreenCTM().inverse());
+    return [p.x, -p.y];
+  };
+  const set = (patch) => {
+    const cur = cameraFor(plan, shot);
+    const next = { x: cur.x, y: cur.y, dir: cur.dir, aimed: plan.cams?.[key]?.aimed || false, ...patch };
+    if (!inside(next.x, next.y, plan.outline)) return;
+    if (!next.aimed || patch.facing) next.dir = [target[0] - next.x, target[1] - next.y];
+    delete next.facing;
+    (plan.cams ||= {})[key] = { x: r1(next.x * 10) / 10, y: r1(next.y * 10) / 10, dir: next.dir, aimed: next.aimed };
+    render();
+  };
+  svg.addEventListener("pointerdown", (ev) => {
+    svg.setPointerCapture(ev.pointerId);
+    const el = ev.target.closest("[data-cam],[data-aim]");
+    if (el?.dataset.aim) drag = "aim";
+    else { drag = "cam"; if (!el) { const [x, y] = toPlan(ev); set({ x, y }); } }
+  });
+  svg.addEventListener("pointermove", (ev) => {
+    if (!drag) return;
+    const [x, y] = toPlan(ev);
+    if (drag === "cam") set({ x, y });
+    else { const cur = cameraFor(plan, shot); set({ dir: [x - cur.x, y - cur.y], aimed: true }); }
+  });
+  const end = () => { if (drag) { drag = null; onCommit(); } };
+  svg.addEventListener("pointerup", end);
+  svg.addEventListener("pointercancel", end);
+  render();
 }
