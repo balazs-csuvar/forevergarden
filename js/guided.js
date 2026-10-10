@@ -145,6 +145,10 @@ export function cameraFor(plan, area) {
   const free = (x, y) => inside(x, y, plan.outline) && !inside(x, y, area.poly) && !others.some((o) => inside(x, y, o.poly));
   const ab = bounds(area.poly);
   let dx = g[0] - c[0], dy = g[1] - c[1];
+  // Borders and their sections are faced square on, from the garden side.
+  const pb = bounds((area.area || area).poly);
+  if (pb.h >= pb.w * 1.5) { dx = Math.sign(dx) || 1; dy = 0; }
+  else if (pb.w >= pb.h * 1.5) { dx = 0; dy = Math.sign(dy) || -1; }
   let d = Math.hypot(dx, dy);
   if (d < 0.5) { dx = 0; dy = -1; d = 1; } // an area in the middle: stand nearer the house
   dx /= d; dy /= d;
@@ -195,7 +199,7 @@ export function viewBoxFor(plan, pad = 0.18) {
 }
 
 // k = metres per screen pixel, so handles and text stay a constant size on screen.
-export function planSvgInner(plan, { k = 0.05, mode = "view", selected = null, highlight = null, camera = null, shot = null } = {}) {
+export function planSvgInner(plan, { k = 0.05, mode = "view", selected = null, highlight = null, camera = null, shot = null, dots = null } = {}) {
   const ob = bounds(plan.outline);
   const font = 12 * k;
   const out = [];
@@ -221,6 +225,11 @@ export function planSvgInner(plan, { k = 0.05, mode = "view", selected = null, h
     const rot = ab.h > ab.w * 1.8 && ab.w < 2.5 ? ` transform="rotate(-90 ${cx} ${cy})"` : "";
     out.push(`<text${rot} x="${cx}" y="${cy + font * 0.35}" font-size="${font}" font-weight="700" text-anchor="middle" fill="#2a2b23" opacity="${dim ? 0.45 : 1}" pointer-events="none" style="paint-order:stroke" stroke="#fbf8f1" stroke-width="${3 * k}">${escXml(a.name)}</text>`);
   });
+  // One dot per plant, coloured by its flower or foliage.
+  if (dots) for (const d of dots) {
+    const [x, y] = S([d.x, d.y]);
+    out.push(`<g data-plant="${escXml(d.key)}" style="cursor:pointer"><circle cx="${x}" cy="${y}" r="${12 * k}" fill="transparent"/><circle cx="${x}" cy="${y}" r="${5.5 * k}" fill="${escXml(d.colour)}" stroke="#fbf8f1" stroke-width="${1.6 * k}"/>${d.multi ? `<circle cx="${x}" cy="${y}" r="${8 * k}" fill="none" stroke="#2a2b23" stroke-width="${1 * k}"/>` : ""}</g>`);
+  }
   if (shot) out.push(`<polygon points="${pts2(shot.poly)}" fill="#c46f4c" fill-opacity=".45" stroke="#c46f4c" stroke-width="${2.8 * k}" pointer-events="none"/>`);
   // Side lengths: on the garden while shaping it, on the selected area while marking areas.
   const sideOf = mode === "shape" ? plan.outline : mode === "areas" && selected ? plan.areas.find((a) => a.id === selected)?.poly : mode === "view" && !highlight ? plan.outline : null;
@@ -558,4 +567,48 @@ export function settleAreas(plan, first = []) {
   }
   plan.areas = [...plan.areas.filter((a) => !a.dead), ...extra];
   return [...new Set(notes)];
+}
+
+/* ---------- where things in a photo sit on the plan ---------- */
+function shotOfSpot(plan, spot) {
+  if (!plan || !spot?.planAreaId) return null;
+  const area = plan.areas.find((a) => a.id === spot.planAreaId);
+  if (!area) return null;
+  const shots = shotsOf(area);
+  return shots.find((s) => s.index === (spot.planSection ?? null)) || shots[Math.min(shots.length - 1, spot.planSection ?? 0)] || null;
+}
+
+// Plan position (metres) of a point on a view's photo (x, y from 0 to 1), worked out from where
+// the photo was taken and which way it faced. Approximate: good to about a metre.
+export function planPoint(plan, spot, x, y) {
+  const sh = shotOfSpot(plan, spot);
+  if (!sh) return null;
+  const cam = cameraFor(plan, sh);
+  const ang = Math.atan((x - 0.5) * 2 * Math.tan(HALF_FOV));
+  const r = [cam.dir[1], -cam.dir[0]];
+  const ray = [cam.dir[0] * Math.cos(ang) + r[0] * Math.sin(ang), cam.dir[1] * Math.cos(ang) + r[1] * Math.sin(ang)];
+  const c = centroid(sh.poly);
+  const ahead = (c[0] - cam.x) * cam.dir[0] + (c[1] - cam.y) * cam.dir[1];
+  const b = bounds(sh.poly);
+  // Lower in the photo is nearer the front of the bed.
+  const depth = cam.along ? 0 : Math.min(b.w, b.h) * (0.72 - y) * 1.4;
+  const t = Math.max(0.3, (ahead + depth) / Math.max(0.25, ray[0] * cam.dir[0] + ray[1] * cam.dir[1]));
+  const px = cam.x + ray[0] * t, py = cam.y + ray[1] * t;
+  return [Math.min(b.x1, Math.max(b.x0, px)), Math.min(b.y1, Math.max(b.y0, py))];
+}
+
+// Views whose part of the plan touches this one (neighbouring border sections, a border's end
+// meeting the back border, and so on).
+export function neighbourSpotIds(plan, spot, spots) {
+  const mine = shotOfSpot(plan, spot);
+  if (!mine) return [];
+  const a = bounds(mine.poly);
+  return spots.filter((s) => s.id !== spot.id).filter((s) => {
+    const sh = shotOfSpot(plan, s);
+    if (!sh) return false;
+    const b = bounds(sh.poly);
+    const gx = Math.max(0, Math.max(a.x0, b.x0) - Math.min(a.x1, b.x1));
+    const gy = Math.max(0, Math.max(a.y0, b.y0) - Math.min(a.y1, b.y1));
+    return Math.hypot(gx, gy) <= 0.6;
+  }).map((s) => s.id);
 }

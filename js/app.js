@@ -7,7 +7,7 @@ import { photoTakenOn } from "./exif.js";
 import { MONTHS, MON, monthRange, nearestArea, bloomCoverage, speciesFor, recommendFor, describeConditions, fitsConditions } from "./recommend.js";
 import * as ai from "./ai.js";
 import { loadWeather, syncWeather, findPlace, monthSummary, lastDays, isoDay } from "./weather.js";
-import { newPlan, bounds, signedArea, centroid, describeSize, setSideLength, presetArea, cameraFor, linkSpot, fmtM, planSvg, mountPlanEditor, settleAreas, shotsFor, shotsOf, isSectioned } from "./guided.js";
+import { newPlan, bounds, signedArea, centroid, describeSize, setSideLength, presetArea, cameraFor, linkSpot, fmtM, planSvg, mountPlanEditor, settleAreas, shotsFor, shotsOf, isSectioned, planPoint, neighbourSpotIds } from "./guided.js";
 
 const ENGINE = "sk5";
 const WORK_SIZE = 1200;
@@ -29,6 +29,7 @@ const ui = { view: "walk", spotId: null, month: new Date().getMonth(), labels: t
 /* ---------- persistence ---------- */
 let saveTimer;
 function save() {
+  syncSightings();
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => setValue("state", state).catch(() => toast("Couldn't save. Storage may be full.")), 150);
 }
@@ -572,6 +573,117 @@ function handleStageTap(event) {
   outlineAt(x, y);
 }
 
+/* ---------- one plant seen in several photos ----------
+   Each photo keeps its own outline of the plant (a placement); placements that are the same
+   plant share a `plant` id and one record: name, confirmation, diary photos, planting date. */
+const SHARED = ["speciesId", "confirmed", "photos", "plantedOn"];
+const syncedAs = new Map(); // plant id -> shared fields as last synced
+const sharedOf = (p) => JSON.stringify(SHARED.map((k) => p[k] ?? null));
+function sightingsOf(p) {
+  return p?.plant ? state.placements.filter((q) => q.plant === p.plant) : p ? [p] : [];
+}
+// Whichever sighting was just changed (identified, confirmed, given a diary photo…) passes
+// that change to the others.
+function syncSightings() {
+  const groups = new Map();
+  for (const p of state.placements) if (p.plant) (groups.get(p.plant) || groups.set(p.plant, []).get(p.plant)).push(p);
+  for (const [id, members] of groups) {
+    if (members.length < 2) { delete members[0].plant; syncedAs.delete(id); continue; }
+    const last = syncedAs.get(id);
+    const source = (last && members.find((m) => sharedOf(m) !== last)) || members[0];
+    for (const m of members) if (m !== source) for (const k of SHARED) {
+      if (source[k] === undefined) delete m[k];
+      else m[k] = k === "photos" ? source.photos.map((ph) => ({ ...ph })) : source[k];
+    }
+    syncedAs.set(id, sharedOf(source));
+  }
+}
+function linkSightings(keep, other) {
+  const id = keep.plant || other.plant || uid("plant");
+  const photos = [...(keep.photos || [])];
+  for (const q of [...sightingsOf(other), other]) {
+    for (const ph of q.photos || []) if (!photos.some((x) => x.id === ph.id)) photos.push({ ...ph });
+    q.plant = id;
+  }
+  keep.plant = id;
+  keep.photos = photos.sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  keep.plantedOn ||= other.plantedOn;
+  syncedAs.delete(id);
+  syncSightings(); // keep's record wins
+}
+function unlinkSighting(p) {
+  const id = p.plant;
+  delete p.plant;
+  p.photos = (p.photos || []).map((ph) => ({ ...ph }));
+  const rest = state.placements.filter((q) => q.plant === id);
+  if (rest.length === 1) delete rest[0].plant;
+  syncedAs.delete(id);
+}
+const sameKey = (a, b) => [a, b].sort().join("|");
+function markDifferent(a, b) { (state.notSame ||= []).push(sameKey(a.plant || a.id, b.plant || b.id)); }
+const knownDifferent = (a, b) => (state.notSame || []).includes(sameKey(a.plant || a.id, b.plant || b.id));
+const spotLabel = (spotId) => state.spots.find((s) => s.id === spotId)?.name || "another view";
+function placementPlanPoint(p) {
+  const spot = state.spots.find((s) => s.id === p.spotId);
+  return planPoint(state.plan, spot, p.x, p.y);
+}
+// Plants tagged in the views next to this one, nearest to (x, y) first, one per plant.
+function nextDoorPlants(spot, x, y) {
+  if (!state.plan || !spot.planAreaId) return [];
+  const near = new Set(neighbourSpotIds(state.plan, spot, state.spots));
+  const here = planPoint(state.plan, spot, x, y);
+  const seen = new Set();
+  const out = [];
+  for (const p of state.placements) {
+    if (p.status !== "existing" || !near.has(p.spotId)) continue;
+    const group = sightingsOf(p);
+    if (group.some((q) => q.spotId === spot.id)) continue; // already tagged in this view
+    const key = p.plant || p.id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const pts = group.map(placementPlanPoint).filter(Boolean);
+    const d = here && pts.length ? Math.min(...pts.map((q) => Math.hypot(q[0] - here[0], q[1] - here[1]))) : 99;
+    out.push({ p, d });
+  }
+  return out.sort((a, b) => a.d - b.d);
+}
+// A small crop of a plant from its own photo, cached for the session.
+const cropUrls = new Map();
+async function plantCropUrl(p) {
+  if (!cropUrls.has(p.id)) {
+    const spot = state.spots.find((s) => s.id === p.spotId);
+    const poly = p.outline?.length > 2 ? p.outline : [[p.x - (p.r || 0.06), p.y - (p.r || 0.06)], [p.x + (p.r || 0.06), p.y + (p.r || 0.06)]];
+    cropUrls.set(p.id, cropFromView(spot, poly).then((blob) => URL.createObjectURL(blob)).catch(() => ""));
+  }
+  return cropUrls.get(p.id);
+}
+const sightingCard = (p, extra = "") => {
+  const sp = speciesFor(state, p.speciesId);
+  return `<button class="swap-card sighting" data-same="${p.id}"><img data-crop="${p.id}" alt="" /><strong>${esc(sp?.name || "Plant")}</strong><small>${esc(spotLabel(p.spotId))}${extra}</small></button>`;
+};
+const fillCrops = (root) => root.querySelectorAll("img[data-crop]").forEach(async (img) => {
+  const p = state.placements.find((q) => q.id === img.dataset.crop);
+  if (p) img.src = await plantCropUrl(p);
+});
+
+// After tagging: is this the same plant as one of that kind just across the edge of the photo?
+function offerSamePlant(p) {
+  const spot = state.spots.find((s) => s.id === p.spotId);
+  const match = nextDoorPlants(spot, p.x, p.y).find(({ p: q, d }) => q.speciesId === p.speciesId && d < 1.6 && !knownDifferent(p, q));
+  if (!match) return false;
+  const q = match.p;
+  const sp = speciesFor(state, p.speciesId);
+  openSheet(`<p class="eyebrow">Seen next door?</p><h2>The same ${esc(sp.name)}?</h2>
+    <p class="muted">There's one tagged ${match.d < 0.8 ? "right next to this spot" : "close by"} in ${esc(spotLabel(q.spotId))}. If it's the same plant, it's kept as one plant seen in both photos.</p>
+    <div class="same-pair"><figure><img data-crop="${p.id}" alt="" /><figcaption>This photo</figcaption></figure><figure><img data-crop="${q.id}" alt="" /><figcaption>${esc(spotLabel(q.spotId))}</figcaption></figure></div>
+    <div class="sheet-actions"><button class="btn dark" id="same-yes">Yes, same plant</button><button class="btn" id="same-no">No, a different one</button></div>`, (body) => {
+    fillCrops(body);
+    body.querySelector("#same-yes").addEventListener("click", () => { linkSightings(q, p); save(); renderWalk(); openPlacementSheet(p.id); toast("Linked: one plant, seen in both photos"); });
+    body.querySelector("#same-no").addEventListener("click", () => { markDifferent(p, q); save(); openPlacementSheet(p.id); });
+  });
+  return true;
+}
+
 /* ---------- tap a plant: outline it, then tag it ---------- */
 async function outlineAt(x, y, looseness = 1) {
   const spot = currentSpot();
@@ -699,17 +811,20 @@ function endTagPhoto() {
   if (ui.view === "walk") renderWalk();
 }
 
-function tagDraftAs(speciesId, confirmed = true) {
+function tagDraftAs(speciesId, confirmed = true, sameAs = null) {
   const d = ui.draft;
   if (!d) return;
   const p = { id: uid("pl"), spotId: d.spotId, speciesId, status: "existing", x: d.seg.cx, y: d.seg.cy, r: d.seg.r, outline: d.seg.poly, confirmed, photos: [] };
   if (d.photoKey) p.photos.push({ id: d.photoKey, date: d.photoDate || isoDay(new Date()) });
   state.placements.push(p);
+  if (sameAs) linkSightings(sameAs, p);
   ui.draft = null;
   ui.photoForTag = false;
   ui.photo = false;
   save();
   renderWalk();
+  if (sameAs) { openPlacementSheet(p.id); toast(`Linked to the ${speciesFor(state, speciesId)?.name || "plant"} in ${spotLabel(sameAs.spotId)}`); return; }
+  if (confirmed && offerSamePlant(p)) return;
   openPlacementSheet(p.id);
   toast(`${speciesFor(state, speciesId)?.name || "Plant"} tagged`);
 }
@@ -722,8 +837,11 @@ function plantResults(q) {
 
 function openTagSheet() {
   const d = ui.draft;
+  const spot = state.spots.find((s) => s.id === d.spotId);
+  const nextDoor = spot ? nextDoorPlants(spot, d.seg.cx, d.seg.cy).slice(0, 10) : [];
   sheet.classList.add("compact");
   openSheet(`<p class="eyebrow">New plant</p><h2>What's this plant?</h2>
+    ${nextDoor.length ? `<div class="sheet-section" style="margin-top:4px"><h3>Already tagged next door? Tap it</h3><div class="swap-strip">${nextDoor.map(({ p }) => sightingCard(p)).join("")}</div></div>` : ""}
     <div class="outline-tools">
       <span class="muted">Outline · drag its edge to adjust</span>
       ${d.drawn ? "" : `<button class="btn small" data-o="tighter">Tighter</button><button class="btn small" data-o="looser">Looser</button>`}
@@ -739,6 +857,11 @@ function openTagSheet() {
         <button class="btn small ghost" id="tag-unsure">Not sure yet</button>
       </div>
     </div>`, (body) => {
+    fillCrops(body);
+    body.querySelectorAll("[data-same]").forEach((btn) => btn.addEventListener("click", () => {
+      const q = state.placements.find((x) => x.id === btn.dataset.same);
+      if (q) tagDraftAs(q.speciesId, q.confirmed !== false, q);
+    }));
     const results = body.querySelector("#tag-results");
     const bind = () => results.querySelectorAll("[data-sp]").forEach((btn) => btn.addEventListener("click", () => tagDraftAs(btn.dataset.sp)));
     const q = body.querySelector("#tag-q");
@@ -897,6 +1020,7 @@ function openPlacementSheet(id, { scrollToSwap = false } = {}) {
     <div class="sheet-section"><div class="rec facts" style="display:flex;padding:0;border:0;background:none">${factChips(sp)}</div></div>
     ${!fit.ok ? `<div class="note-box" style="background:#f6e2d6">Watch out: ${esc(fit.why)} (${esc(area.name)}).</div>` : ""}
     ${sp.note ? `<div class="note-box" style="margin-top:10px">${esc(sp.note)}</div>` : ""}
+    ${planned ? "" : alsoInSection(p)}
     ${planned ? "" : diarySection(p)}
     ${swap}
     <div class="sheet-actions">${actions}</div>`, (body) => {
@@ -913,6 +1037,17 @@ function openPlacementSheet(id, { scrollToSwap = false } = {}) {
     body.querySelectorAll("[data-act]").forEach((btn) => btn.addEventListener("click", () => placementAction(p, btn.dataset.act)));
     body.querySelectorAll("img[data-photo-src]").forEach(async (img) => { img.src = await photoUrl(img.dataset.photoSrc); });
     body.querySelectorAll("[data-diary]").forEach((btn) => btn.addEventListener("click", () => openDiaryPhoto(p, btn.dataset.diary)));
+    body.querySelectorAll("[data-also]").forEach((btn) => btn.addEventListener("click", () => {
+      const q = state.placements.find((x) => x.id === btn.dataset.also);
+      if (q) { closeSheet(); goToSpot(q.spotId).then(() => openPlacementSheet(q.id)); }
+    }));
+    body.querySelector("#unlink")?.addEventListener("click", () => {
+      const others = sightingsOf(p).filter((q) => q !== p);
+      unlinkSighting(p);
+      others.slice(0, 1).forEach((q) => markDifferent(p, q));
+      save(); openPlacementSheet(p.id); toast("Now recorded as a separate plant");
+    });
+    body.querySelector("#link-next-door")?.addEventListener("click", () => linkNextDoorSheet(p));
     if (scrollToSwap) body.querySelector("#swap-section")?.scrollIntoView({ block: "nearest" });
   });
 }
@@ -924,7 +1059,9 @@ function placementAction(p, act) {
     if (ui.view !== "walk") switchView("walk");
     setMode({ type: "move", id: p.id }, `Tap where ${sp.name} should go`);
   } else if (act === "remove") {
-    if (!confirm(`Remove ${sp.name} from this view?`)) return;
+    const others = sightingsOf(p).length - 1;
+    if (!confirm(others ? `Remove ${sp.name} from this photo? It stays recorded in ${others} other photo${others > 1 ? "s" : ""}.` : `Remove ${sp.name} from this view?`)) return;
+    if (p.plant) unlinkSighting(p);
     state.placements = state.placements.filter((item) => item.id !== p.id);
     save(); closeSheet(); renderWalk(); refreshCurrentView();
   } else if (act === "planted") {
@@ -953,6 +1090,27 @@ function placementAction(p, act) {
   } else if (act === "details") {
     fillInDetails(p);
   }
+}
+
+// "Also in" these photos, with a way to undo a wrong link or link one by hand.
+function alsoInSection(p) {
+  const others = sightingsOf(p).filter((q) => q !== p);
+  const spot = state.spots.find((s) => s.id === p.spotId);
+  const canLink = spot && nextDoorPlants(spot, p.x, p.y).some(({ p: q }) => q.speciesId === p.speciesId);
+  if (!others.length) return canLink ? `<div class="sheet-section"><button class="btn small" id="link-next-door">Same plant as one in the next photo?</button></div>` : "";
+  return `<div class="sheet-section"><h3>Also seen in</h3><div class="chip-row">${others.map((q) => `<button class="btn small" data-also="${q.id}">${esc(spotLabel(q.spotId))}</button>`).join("")}<button class="btn small ghost" id="unlink">Not the same plant</button></div></div>`;
+}
+function linkNextDoorSheet(p) {
+  const spot = state.spots.find((s) => s.id === p.spotId);
+  const list = nextDoorPlants(spot, p.x, p.y).filter(({ p: q }) => q.speciesId === p.speciesId).slice(0, 10);
+  openSheet(`<p class="eyebrow">${esc(speciesFor(state, p.speciesId)?.name || "Plant")}</p><h2>Which one is it?</h2><p class="muted">Tap the same plant in a neighbouring photo.</p>
+    <div class="swap-strip">${list.map(({ p: q }) => sightingCard(q)).join("")}</div>`, (body) => {
+    fillCrops(body);
+    body.querySelectorAll("[data-same]").forEach((btn) => btn.addEventListener("click", () => {
+      const q = state.placements.find((x) => x.id === btn.dataset.same);
+      linkSightings(q, p); save(); renderWalk(); openPlacementSheet(p.id); toast("Linked: one plant, seen in both photos");
+    }));
+  });
 }
 
 const needsDetails = (sp) => sp && (sp.source === "uk-native" || (!sp.bloom?.length && sp.source === "custom"));
@@ -1462,6 +1620,19 @@ Suggest 5 plants that genuinely suit this exact spot and work with what is alrea
 }
 
 /* ---------- plants & views ---------- */
+function checkRepeat(a, b) {
+  if (!a || !b) return;
+  const sp = speciesFor(state, a.speciesId);
+  openSheet(`<p class="eyebrow">Same plant twice?</p><h2>${esc(sp?.name || "Plant")}</h2>
+    <p class="muted">These are close together on your plan, in neighbouring photos.</p>
+    <div class="same-pair"><figure><img data-crop="${a.id}" alt="" /><figcaption>${esc(spotLabel(a.spotId))}</figcaption></figure><figure><img data-crop="${b.id}" alt="" /><figcaption>${esc(spotLabel(b.spotId))}</figcaption></figure></div>
+    <div class="sheet-actions"><button class="btn dark" id="same-yes">Same plant</button><button class="btn" id="same-no">Two different plants</button></div>`, (body) => {
+    fillCrops(body);
+    body.querySelector("#same-yes").addEventListener("click", () => { linkSightings(a, b); save(); closeSheet(); refreshCurrentView(); toast("Linked: counted once from now on"); });
+    body.querySelector("#same-no").addEventListener("click", () => { markDifferent(a, b); save(); closeSheet(); refreshCurrentView(); });
+  });
+}
+
 // The view behind a tapped part of the plan: a border section, or a whole area.
 function planTapSpot(el) {
   const shotKey = el.closest?.("[data-shot]")?.dataset.shot;
@@ -1470,6 +1641,38 @@ function planTapSpot(el) {
   const index = shotKey ? Number(shotKey.split("#")[1]) : null;
   const mine = state.spots.filter((s) => s.planAreaId === areaId);
   return mine.find((s) => (s.planSection ?? null) === index) || mine[0] || null;
+}
+
+// Each plant once, however many photos it appears in.
+function uniquePlants() {
+  const seen = new Set();
+  return state.placements.filter((p) => p.status === "existing").filter((p) => {
+    const key = p.plant || p.id;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+// Same kind of plant, close together on the plan, in different photos, not yet linked: probably one plant.
+function likelyRepeats() {
+  if (!state.plan) return [];
+  const plants = uniquePlants().map((p) => ({ p, pts: sightingsOf(p).map(placementPlanPoint).filter(Boolean), spots: new Set(sightingsOf(p).map((q) => q.spotId)) })).filter((x) => x.pts.length);
+  const out = [];
+  for (let i = 0; i < plants.length; i++) for (let j = i + 1; j < plants.length; j++) {
+    const a = plants[i], b = plants[j];
+    if (a.p.speciesId !== b.p.speciesId || [...a.spots].some((s) => b.spots.has(s)) || knownDifferent(a.p, b.p)) continue;
+    const d = Math.min(...a.pts.flatMap((u) => b.pts.map((v) => Math.hypot(u[0] - v[0], u[1] - v[1]))));
+    if (d < 1.2) out.push({ a: a.p, b: b.p, d });
+  }
+  return out.sort((x, y) => x.d - y.d).slice(0, 6);
+}
+function planDots() {
+  return uniquePlants().map((p) => {
+    const pts = sightingsOf(p).map(placementPlanPoint).filter(Boolean);
+    if (!pts.length) return null;
+    const sp = speciesFor(state, p.speciesId);
+    return { key: p.id, x: pts.reduce((t, q) => t + q[0], 0) / pts.length, y: pts.reduce((t, q) => t + q[1], 0) / pts.length, colour: sp?.flower || sp?.foliage || "#5d7650", multi: pts.length > 1 };
+  }).filter(Boolean);
 }
 
 async function renderPlants() {
@@ -1481,15 +1684,18 @@ async function renderPlants() {
   const planCard = $("#plan-card");
   planCard.hidden = !state.plan;
   if (state.plan) {
-    $("#plan-figure").innerHTML = planSvg(state.plan, { widthPx: Math.min(560, window.innerWidth - 66), heightPx: window.innerHeight * 0.52 }, 'class="plan-svg" role="img" aria-label="Plan of your garden"');
+    $("#plan-figure").innerHTML = planSvg(state.plan, { dots: planDots(), widthPx: Math.min(560, window.innerWidth - 66), heightPx: window.innerHeight * 0.52 }, 'class="plan-svg" role="img" aria-label="Plan of your garden"');
+    const repeats = likelyRepeats();
+    $("#plan-repeats").innerHTML = repeats.length ? `<h3>Same plant twice?</h3>${repeats.map(({ a, b }) => `<div class="row"><div class="grow"><strong>${esc(speciesFor(state, a.speciesId)?.name)}</strong><small>${esc(spotLabel(a.spotId))} and ${esc(spotLabel(b.spotId))}</small></div><button class="btn small" data-rep-check="${a.id}|${b.id}">Check</button></div>`).join("")}` : "";
     $("#plan-figure").querySelectorAll("[data-area], [data-shot]").forEach((el) => { if (planTapSpot(el)) el.classList.add("tappable"); });
   }
-  const existing = state.placements.filter((p) => p.status === "existing");
-  $("#existing-count").textContent = `${existing.length} recorded · ${existing.filter((p) => !p.confirmed).length} to confirm`;
+  const existing = uniquePlants();
+  $("#existing-count").textContent = `${existing.length} plant${existing.length === 1 ? "" : "s"} · ${existing.filter((p) => !p.confirmed).length} to confirm`;
   $("#existing-list").innerHTML = existing.length ? existing.map((p) => {
     const sp = speciesFor(state, p.speciesId);
     const spot = state.spots.find((s) => s.id === p.spotId);
-    return `<div class="row"><span class="num${p.confirmed ? "" : " unconfirmed"}">${numbering(p.spotId).get(p.id)}</span><div class="grow"><strong>${esc(sp?.name)}</strong><small>${esc(spot?.name)}${p.confirmed ? "" : " · to confirm"}${sp?.bloom?.length ? ` · flowers ${monthRange(sp.bloom)}` : ""}${p.photos?.length ? ` · ${p.photos.length} photo${p.photos.length > 1 ? "s" : ""}` : ""}</small></div><button class="btn small" data-show="${p.id}">Show</button></div>`;
+    const more = sightingsOf(p).length - 1;
+    return `<div class="row"><span class="num${p.confirmed ? "" : " unconfirmed"}">${numbering(p.spotId).get(p.id)}</span><div class="grow"><strong>${esc(sp?.name)}</strong><small>${esc(spot?.name)}${more ? ` + ${more} more photo${more > 1 ? "s" : ""}` : ""}${p.confirmed ? "" : " · to confirm"}${sp?.bloom?.length ? ` · flowers ${monthRange(sp.bloom)}` : ""}${p.photos?.length ? ` · ${p.photos.length} photo${p.photos.length > 1 ? "s" : ""}` : ""}</small></div><button class="btn small" data-show="${p.id}">Show</button></div>`;
   }).join("") : `<p class="empty">No plants recorded yet.</p>`;
 }
 
@@ -1936,14 +2142,15 @@ async function exportExcel() {
   try {
     const XLSX = await import("https://esm.sh/xlsx@0.18.5");
     const LIGHT = { full: "Full sun", part: "Part shade", shade: "Shade" };
-    const plants = state.placements.map((p) => {
+    const plants = [...uniquePlants(), ...state.placements.filter((p) => p.status === "planned")].map((p) => {
       const sp = speciesFor(state, p.speciesId) || {};
       const spot = state.spots.find((s) => s.id === p.spotId);
+      const views = [...new Set(sightingsOf(p).map((q) => spotLabel(q.spotId)))].join("; ");
       const area = spot ? nearestArea(spot, p.x, p.y) : null;
       const photos = [...(p.photos || [])].sort((a, b) => (a.date || "").localeCompare(b.date || ""));
       return {
         "No.": spot ? numbering(spot.id).get(p.id) : "",
-        View: spot?.name || "",
+        View: views || spot?.name || "",
         Area: area?.name || "",
         Status: p.status === "planned" ? "Planned" : p.confirmed ? "In the garden" : "In the garden (ID to confirm)",
         "Common name": sp.name || "",
@@ -2225,7 +2432,14 @@ function bindEvents() {
     const g = await runGuidedWalk({ garden: state });
     if (g) { state = g; save(); ui.spotId = state.startSpotId; switchView("walk"); toast("Plan and photos saved. Earlier photos are kept for comparison."); }
   });
+  $("#plan-repeats").addEventListener("click", (e) => {
+    const ids = e.target.closest("[data-rep-check]")?.dataset.repCheck.split("|");
+    if (ids) checkRepeat(...ids.map((id) => state.placements.find((p) => p.id === id)));
+  });
   $("#plan-figure").addEventListener("click", (e) => {
+    const plantId = e.target.closest("[data-plant]")?.dataset.plant;
+    const pl = plantId && state.placements.find((p) => p.id === plantId);
+    if (pl) { ui.spotId = pl.spotId; persistUi(); switchView("walk"); setTimeout(() => openPlacementSheet(pl.id), 300); return; }
     const spot = planTapSpot(e.target);
     if (spot) { ui.spotId = spot.id; persistUi(); switchView("walk"); }
   });
