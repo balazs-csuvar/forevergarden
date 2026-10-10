@@ -7,7 +7,7 @@ import { photoTakenOn } from "./exif.js";
 import { MONTHS, MON, monthRange, nearestArea, bloomCoverage, speciesFor, recommendFor, describeConditions, fitsConditions } from "./recommend.js";
 import * as ai from "./ai.js";
 import { loadWeather, syncWeather, findPlace, monthSummary, lastDays, isoDay } from "./weather.js";
-import { GUIDE_STEPS, GUIDE_LINKS, GUIDE_AREAS, guideDiagram } from "./guided.js";
+import { newPlan, bounds, signedArea, centroid, describeSize, setSideLength, presetArea, cameraFor, linkSpot, fmtM, planSvg, mountPlanEditor } from "./guided.js";
 
 const ENGINE = "sk5";
 const WORK_SIZE = 1200;
@@ -1468,6 +1468,15 @@ async function renderPlants() {
     return `<div class="row"><img class="thumb" src="${await photoUrl(spot.photoId)}" alt="" /><div class="grow"><strong>${esc(spot.name)}</strong><small>${here.filter((p) => p.status === "existing").length} plants · ${here.filter((p) => p.status === "planned").length} planned · ${spot.links.length} paths</small></div><button class="btn small" data-view-act="open" data-id="${spot.id}">Open</button><button class="btn small ghost" data-view-act="more" data-id="${spot.id}" aria-label="More">⋯</button></div>`;
   }));
   $("#views-list").innerHTML = rows.join("");
+  const planCard = $("#plan-card");
+  planCard.hidden = !state.plan;
+  if (state.plan) {
+    $("#plan-figure").innerHTML = planSvg(state.plan, { widthPx: Math.min(560, window.innerWidth - 66), heightPx: window.innerHeight * 0.52 }, 'class="plan-svg" role="img" aria-label="Plan of your garden"');
+    $("#plan-figure").querySelectorAll("[data-area]").forEach((el) => {
+      const a = state.plan.areas.find((x) => x.id === el.dataset.area);
+      if (a?.spotId && state.spots.some((s) => s.id === a.spotId)) el.classList.add("tappable");
+    });
+  }
   const existing = state.placements.filter((p) => p.status === "existing");
   $("#existing-count").textContent = `${existing.length} recorded · ${existing.filter((p) => !p.confirmed).length} to confirm`;
   $("#existing-list").innerHTML = existing.length ? existing.map((p) => {
@@ -1676,63 +1685,213 @@ async function replaceSpotPhoto(spot, blob, taken = null) {
   await deleteBlobsWithPrefix(`wc:${spot.id}:`);
 }
 
+// Plan first: size, shape and areas of the garden, then one photo of each area.
 function runGuidedWalk({ garden = null } = {}) {
   return new Promise((resolve) => {
     const panel = $("#guide");
-    const taken = {};
-    let i = 0;
+    const plan = garden?.plan ? JSON.parse(JSON.stringify(garden.plan)) : null;
+    const work = { plan, photos: {} };
+    let step = plan ? "shape" : "size";
+    let photoIndex = 0;
     document.body.classList.add("guiding");
     panel.hidden = false;
     const close = (result) => { panel.hidden = true; panel.innerHTML = ""; document.body.classList.remove("guiding"); resolve(result); };
-    const render = () => {
-      const step = GUIDE_STEPS[i];
-      const existing = garden?.spots.find((sp) => sp.guideKey === step.key);
-      panel.innerHTML = `<div class="guide-top"><button class="btn small ghost" id="g-cancel">${garden ? "Cancel" : "Back"}</button><div class="guide-dots">${GUIDE_STEPS.map((_, k) => `<i class="${k < i ? "done" : k === i ? "now" : ""}"></i>`).join("")}</div></div>
-        <p class="eyebrow">Photo ${i + 1} of ${GUIDE_STEPS.length}${existing ? " · retake for this season" : ""}</p>
-        <h1>${esc(step.title)}</h1>
-        ${guideDiagram(step)}
-        <p class="lede">${esc(step.text)}</p>
-        <p class="muted" style="margin:0">Hold the phone upright at chest height, the same way each time, so seasons line up.</p>
-        <button class="btn dark onboard-btn" id="g-photo">${taken[step.key] ? "Retake photo ✓" : "Take photo"}</button>
-        ${i > 0 || garden ? `<button class="btn ghost" id="g-skip">${step.optional ? "Skip" : "Skip this one"}</button>` : ""}`;
-      panel.querySelector("#g-cancel").addEventListener("click", () => (i > 0 ? (i -= 1, render()) : close(null)));
+    const dots = () => {
+      const all = ["size", "shape", "areas", ...(work.plan?.areas || []).map((_, k) => `photo${k}`)];
+      const now = step === "photo" ? `photo${photoIndex}` : step;
+      const at = all.indexOf(now);
+      return `<div class="guide-dots">${all.map((_, k) => `<i class="${k < at ? "done" : k === at ? "now" : ""}"></i>`).join("")}</div>`;
+    };
+    const top = (backLabel) => `<div class="guide-top"><button class="btn small ghost" id="g-back">${backLabel}</button>${dots()}</div>`;
+    const num = (v) => { const n = parseFloat(String(v).replace(",", ".")); return Number.isFinite(n) && n > 0 ? n : null; };
+    // Inline editors under the plan: type a side's length, or remove a tapped corner.
+    const sideEditor = (box, pts, i, apply) => {
+      const a = pts[i], b = pts[(i + 1) % pts.length];
+      box.innerHTML = `<div class="plan-edit-row"><label class="field grow">Length of this side (m)<input type="text" inputmode="decimal" id="g-side" value="${+Math.hypot(b[0] - a[0], b[1] - a[1]).toFixed(1)}" /></label><button class="btn small dark" id="g-side-set">Set</button></div>`;
+      const input = box.querySelector("#g-side");
+      input.focus(); input.select();
+      const go = () => { const v = num(input.value); if (v && v < 500) apply(v); else toast("Enter a length in metres"); };
+      box.querySelector("#g-side-set").addEventListener("click", go);
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
+    };
+    const cornerEditor = (box, remove) => {
+      box.innerHTML = `<div class="plan-edit-row"><span class="grow muted">Corner selected</span><button class="btn small" id="g-corner-del">Remove this corner</button></div>`;
+      box.querySelector("#g-corner-del").addEventListener("click", remove);
+    };
+
+    const renderSize = () => {
+      const b = work.plan ? bounds(work.plan.outline) : { w: 6, h: 12 };
+      panel.innerHTML = `${top(garden ? "Cancel" : "Back")}
+        <p class="eyebrow">Your garden plan</p>
+        <h1>How big is <em>your garden?</em></h1>
+        <p class="lede">A rough size is fine. You'll fine-tune the shape next, then mark the areas you'll photograph.</p>
+        <div class="field-row">
+          <label class="field">Width along the house (m)<input type="text" inputmode="decimal" id="g-w" value="${+b.w.toFixed(1)}" /></label>
+          <label class="field">House to the back (m)<input type="text" inputmode="decimal" id="g-l" value="${+b.h.toFixed(1)}" /></label>
+        </div>
+        <p class="muted" style="margin:0">Pace it out if you don't have a tape: one big stride is about a metre.</p>
+        <button class="btn dark onboard-btn" id="g-next">Next: the shape</button>`;
+      panel.querySelector("#g-back").addEventListener("click", () => close(null));
+      panel.querySelector("#g-next").addEventListener("click", () => {
+        const w = num(panel.querySelector("#g-w").value), l = num(panel.querySelector("#g-l").value);
+        if (!w || !l || w > 500 || l > 500) { toast("Enter the width and length in metres"); return; }
+        const fresh = newPlan(w, l);
+        if (work.plan) {
+          // Resizing an existing plan: scale it rather than throwing the shape away.
+          const ob = bounds(work.plan.outline);
+          const sx = w / (ob.w || 1), sy = l / (ob.h || 1);
+          const scale = (pts) => pts.map(([x, y]) => [+((x - ob.x0) * sx).toFixed(1), +((y - ob.y0) * sy).toFixed(1)]);
+          work.plan.outline = scale(work.plan.outline);
+          work.plan.areas.forEach((a) => { a.poly = scale(a.poly); });
+        } else work.plan = fresh;
+        step = "shape"; render();
+      });
+    };
+
+    const renderShape = () => {
+      panel.innerHTML = `${top("Back")}
+        <p class="eyebrow">Your garden plan</p>
+        <h1>Shape it</h1>
+        <svg class="plan-editor" font-family="DM Sans, sans-serif" role="img" aria-label="Plan of the garden"></svg>
+        <div id="g-edit" class="plan-edit"><p class="muted" style="margin:0">Drag the orange corners to match your garden. Tap <b>+</b> to add a corner (for an L-shape or a kink). Tap a measurement to type the exact length.</p></div>
+        <button class="btn dark onboard-btn" id="g-next">Next: areas to photograph</button>`;
+      const edit = panel.querySelector("#g-edit");
+      const editor = mountPlanEditor(panel.querySelector(".plan-editor"), work.plan, {
+        mode: "shape",
+        onSide: (i) => sideEditor(edit, work.plan.outline, i, (v) => { work.plan.outline = setSideLength(work.plan.outline, i, v); renderShape(); }),
+        onCorner: (i) => { if (work.plan.outline.length > 3) cornerEditor(edit, () => { work.plan.outline.splice(i, 1); renderShape(); }); }
+      });
+      panel.querySelector("#g-back").addEventListener("click", () => { step = "size"; render(); });
+      panel.querySelector("#g-next").addEventListener("click", () => {
+        if (Math.abs(signedArea(work.plan.outline)) < 1) { toast("The garden shape looks too small"); return; }
+        if (!work.plan.areas.length) ["left", "right", "back"].forEach((kind) => work.plan.areas.push({ id: uid("parea"), ...presetArea(work.plan, kind) }));
+        step = "areas"; render();
+      });
+    };
+
+    const renderAreas = (selectId = null) => {
+      const usedNames = new Set(work.plan.areas.map((a) => a.name));
+      const presets = [["left", "Left border"], ["right", "Right border"], ["back", "Back of the garden"], ["middle", "Lawn"], ["other", "Other area"]];
+      panel.innerHTML = `${top("Back")}
+        <p class="eyebrow">Your garden plan</p>
+        <h1>Areas to <em>photograph</em></h1>
+        <p class="muted" style="margin:0">One photo each. Tap an area to rename it or drag its corners; tap + below to add more.</p>
+        <svg class="plan-editor" font-family="DM Sans, sans-serif" role="img" aria-label="Plan of the garden with areas"></svg>
+        <div id="g-edit" class="plan-edit"></div>
+        <div class="chip-row">${presets.filter(([k, label]) => k === "other" || !usedNames.has(label)).map(([k, label]) => `<button class="btn small" data-preset="${k}">+ ${label}</button>`).join("")}</div>
+        <button class="btn dark onboard-btn" id="g-next" ${work.plan.areas.length ? "" : "disabled"}>Next: take ${work.plan.areas.length || ""} photo${work.plan.areas.length === 1 ? "" : "s"}</button>`;
+      const edit = panel.querySelector("#g-edit");
+      const showSelected = (id) => {
+        const a = work.plan.areas.find((x) => x.id === id);
+        if (!a) { edit.innerHTML = `<p class="muted" style="margin:0">${work.plan.areas.length ? "Tap an area on the plan to change it." : "Add the areas you'd like to photograph."}</p>`; return; }
+        edit.innerHTML = `<div class="plan-edit-row"><label class="field grow">Name<input type="text" id="g-aname" value="${esc(a.name)}" /></label><button class="btn small ghost" id="g-adel">Remove</button></div>
+          <p class="muted" style="margin:4px 0 0" id="g-asize">${describeSize(a.poly)}${a.spotId ? " · has photos" : ""}</p>`;
+        const name = edit.querySelector("#g-aname");
+        name.addEventListener("input", () => { a.name = name.value.trim() || "Unnamed area"; editor.render(); });
+        edit.querySelector("#g-adel").addEventListener("click", () => { work.plan.areas = work.plan.areas.filter((x) => x.id !== a.id); renderAreas(); });
+      };
+      const editor = mountPlanEditor(panel.querySelector(".plan-editor"), work.plan, {
+        mode: "areas",
+        onSelect: showSelected,
+        onChange: () => { const s = edit.querySelector("#g-asize"); const a = work.plan.areas.find((x) => x.id === editor.selected); if (s && a) s.textContent = describeSize(a.poly); },
+        onSide: (i) => {
+          const a = work.plan.areas.find((x) => x.id === editor.selected);
+          if (!a) return;
+          sideEditor(edit, a.poly, i, (v) => { a.poly = setSideLength(a.poly, i, v); renderAreas(a.id); });
+        },
+        onCorner: (i) => {
+          const a = work.plan.areas.find((x) => x.id === editor.selected);
+          if (a && a.poly.length > 3) cornerEditor(edit, () => { a.poly.splice(i, 1); renderAreas(a.id); });
+        }
+      });
+      if (selectId) editor.select(selectId);
+      showSelected(selectId);
+      panel.querySelectorAll("[data-preset]").forEach((btn) => btn.addEventListener("click", () => {
+        const a = { id: uid("parea"), ...presetArea(work.plan, btn.dataset.preset) };
+        work.plan.areas.push(a);
+        renderAreas(a.id);
+      }));
+      panel.querySelector("#g-back").addEventListener("click", () => { step = "shape"; render(); });
+      panel.querySelector("#g-next").addEventListener("click", () => { if (!work.plan.areas.length) return; photoIndex = 0; step = "photo"; render(); });
+    };
+
+    const renderPhoto = () => {
+      const areas = work.plan.areas;
+      const a = areas[photoIndex];
+      const cam = cameraFor(work.plan, a);
+      const existing = garden?.spots.find((sp) => sp.planAreaId === a.id);
+      const shot = work.photos[a.id];
+      panel.innerHTML = `${top("Back")}
+        <p class="eyebrow">Photo ${photoIndex + 1} of ${areas.length}${existing ? " · retake for this season" : ""}</p>
+        <h1>${esc(a.name)}</h1>
+        ${planSvg(work.plan, { highlight: a.id, camera: cam, widthPx: Math.min(440, window.innerWidth - 48), heightPx: window.innerHeight * 0.34 }, 'class="plan-svg guide-plan" role="img" aria-label="Plan showing where to stand"')}
+        <p class="lede">${cam.along
+          ? `Stand at the house end, just beside the ${esc(a.name.toLowerCase())}, and look along it so it runs away from you. Fit in as much as you can.`
+          : `Stand about ${fmtM(cam.dist)} back, facing the ${esc(a.name.toLowerCase())}, and fit all of it in from end to end.`}</p>
+        <p class="muted" style="margin:0">Hold the phone upright at chest height, the same way each time, so the seasons line up.</p>
+        <button class="btn dark onboard-btn" id="g-photo">${shot ? "Retake photo ✓" : "Take photo"}</button>
+        <button class="btn ghost" id="g-skip">${photoIndex === areas.length - 1 ? (shot || Object.keys(work.photos).length ? "Finish" : "Skip") : "Skip this one"}</button>`;
+      panel.querySelector("#g-back").addEventListener("click", () => { if (photoIndex > 0) photoIndex -= 1; else step = "areas"; render(); });
       panel.querySelector("#g-photo").addEventListener("click", async () => {
         const blob = await pickPhoto();
         if (!blob) return;
-        taken[step.key] = blob;
+        work.photos[a.id] = blob;
         next();
       });
-      panel.querySelector("#g-skip")?.addEventListener("click", next);
+      panel.querySelector("#g-skip").addEventListener("click", next);
     };
-    const next = () => { if (i < GUIDE_STEPS.length - 1) { i += 1; render(); } else finish(); };
+    const next = () => { if (photoIndex < work.plan.areas.length - 1) { photoIndex += 1; render(); } else finish(); };
+
     const finish = async () => {
-      if (!Object.keys(taken).length) { close(null); return; }
+      const hasPhotos = Object.keys(work.photos).length > 0;
+      if (!hasPhotos && !garden) { toast("Take at least one photo to start your garden"); return; }
       panel.innerHTML = `<div class="guide-busy"><div class="brush"></div><p class="hand">Laying out your garden…</p></div>`;
-      const g = garden || { version: 2, settings: { gardenName: "My garden", region: "UK", hardiness: 4, soil: "unknown", aspect: "S", aspectConfirmed: false }, startSpotId: null, species: {}, spots: [], placements: [], backdrop: {} };
-      for (const step of GUIDE_STEPS) {
-        const blob = taken[step.key];
-        if (!blob) continue;
-        let spot = g.spots.find((sp) => sp.guideKey === step.key);
-        const taken = await photoTakenOn(blob);
-        if (spot) await replaceSpotPhoto(spot, blob, taken);
-        else {
-          const id = uid("spot");
-          await putBlob(`photo:${id}`, await resizeBlob(blob, 1600, 0.86));
-          spot = newSpot(id, step.title, `photo:${id}`);
-          spot.guideKey = step.key;
-          spot.photoDate = taken;
-          spot.areas = GUIDE_AREAS[step.key].map((a) => ({ id: uid("area"), light: "part", moist: "moist", maxH: 3, climbers: true, note: "Set its light and moisture so ideas fit.", ...a }));
-          g.spots.push(spot);
+      try {
+        const g = garden || { version: 2, settings: { gardenName: "My garden", region: "UK", hardiness: 4, soil: "unknown", aspect: "S", aspectConfirmed: false }, startSpotId: null, species: {}, spots: [], placements: [], backdrop: {} };
+        g.plan = work.plan;
+        for (const a of work.plan.areas) {
+          let spot = g.spots.find((sp) => sp.planAreaId === a.id);
+          const blob = work.photos[a.id];
+          if (spot) spot.name = a.name;
+          if (!blob) continue;
+          const takenOn = await photoTakenOn(blob);
+          if (spot) await replaceSpotPhoto(spot, blob, takenOn);
+          else {
+            const id = uid("spot");
+            await putBlob(`photo:${id}`, await resizeBlob(blob, 1600, 0.86));
+            spot = newSpot(id, a.name, `photo:${id}`);
+            spot.planAreaId = a.id;
+            spot.photoDate = takenOn;
+            Object.assign(spot.areas[0], { name: a.name, note: `About ${describeSize(a.poly)} on your plan. Set its light and moisture so ideas fit.` });
+            g.spots.push(spot);
+          }
+          a.spotId = spot.id;
         }
+        // Path markers between the areas' photos, placed by where each area lies from where you stood.
+        const withSpots = work.plan.areas.map((a) => ({ a, spot: g.spots.find((sp) => sp.planAreaId === a.id) })).filter((x) => x.spot);
+        for (const { a, spot } of withSpots) {
+          const cam = cameraFor(work.plan, a);
+          for (const { a: b, spot: to } of withSpots) {
+            if (to === spot || spot.links.some((l) => l.to === to.id)) continue;
+            const pos = linkSpot(cam, centroid(b.poly));
+            while (spot.links.some((l) => Math.abs(l.x - pos.x) < 0.1 && Math.abs(l.y - pos.y) < 0.06)) pos.y -= 0.08;
+            spot.links.push({ id: uid("link"), x: +pos.x.toFixed(3), y: +pos.y.toFixed(3), to: to.id, label: b.name });
+          }
+        }
+        if (!g.spots.length) throw new Error("No photos were saved");
+        if (!g.spots.some((sp) => sp.id === g.startSpotId)) g.startSpotId = (withSpots[0]?.spot || g.spots[0]).id;
+        await setValue("state", g);
+        close(g);
+      } catch (error) {
+        console.error(error);
+        toast(`Couldn't save the walk: ${error.message}`, 6000);
+        step = "photo"; photoIndex = Math.max(0, work.plan.areas.length - 1); render();
       }
-      const byKey = Object.fromEntries(g.spots.filter((sp) => sp.guideKey).map((sp) => [sp.guideKey, sp]));
-      for (const l of GUIDE_LINKS) {
-        const from = byKey[l.from], to = byKey[l.to];
-        if (from && to && !from.links.some((x) => x.to === to.id)) from.links.push({ id: uid("link"), x: l.x, y: l.y, to: to.id, label: l.label });
-      }
-      g.startSpotId ||= (byKey.house || g.spots[0]).id;
-      await setValue("state", g);
-      close(g);
+    };
+
+    const render = () => {
+      panel.scrollTop = 0; window.scrollTo(0, 0);
+      ({ size: renderSize, shape: renderShape, areas: renderAreas, photo: renderPhoto })[step]();
     };
     render();
   });
@@ -2031,8 +2190,14 @@ function bindEvents() {
   $("#excel-btn").addEventListener("click", exportExcel);
   $("#guided-btn").addEventListener("click", async () => {
     const g = await runGuidedWalk({ garden: state });
-    if (g) { state = g; save(); ui.spotId = state.startSpotId; switchView("walk"); toast("Photos saved. Earlier ones are kept for comparison."); }
+    if (g) { state = g; save(); ui.spotId = state.startSpotId; switchView("walk"); toast("Plan and photos saved. Earlier photos are kept for comparison."); }
   });
+  $("#plan-figure").addEventListener("click", (e) => {
+    const id = e.target.closest("[data-area]")?.dataset.area;
+    const a = state.plan?.areas.find((x) => x.id === id);
+    if (a?.spotId && state.spots.some((s) => s.id === a.spotId)) { ui.spotId = a.spotId; persistUi(); switchView("walk"); }
+  });
+  $("#plan-edit-btn").addEventListener("click", () => $("#guided-btn").click());
   $("#views-list").addEventListener("click", (e) => {
     const btn = e.target.closest("[data-view-act]");
     if (!btn) return;

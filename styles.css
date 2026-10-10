@@ -131,7 +131,16 @@ body.guiding .app, body.guiding .onboarding-panel:not(.guide-panel) { display: n
 .guide-dots i { width: 9px; height: 9px; border-radius: 50%; background: var(--line); }
 .guide-dots i.done { background: var(--sage); }
 .guide-dots i.now { background: var(--terra); }
-.guide-diagram { width: 100%; height: 34dvh; flex: none; margin: 4px 0; stroke: none; fill: none; }
+.plan-editor, .plan-svg { stroke: none; stroke-width: 0; fill: none; }
+.plan-editor { width: 100%; height: 44dvh; flex: none; touch-action: none; user-select: none; -webkit-user-select: none; background: var(--paper-2); border-radius: 14px; }
+.plan-svg { width: 100%; height: auto; max-height: 52dvh; display: block; }
+.guide-plan { max-height: 34dvh; flex: none; margin: 4px 0; }
+.plan-svg .tappable { cursor: pointer; }
+.plan-edit { min-height: 44px; }
+.plan-edit-row { display: flex; align-items: flex-end; gap: 8px; }
+.plan-edit-row .grow { flex: 1; min-width: 0; }
+.chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.btn:disabled { opacity: 0.45; }
 .guide-busy { min-height: 70dvh; display: grid; place-content: center; justify-items: center; gap: 14px; }
 .diary-strip { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
 .diary-thumb { flex: none; width: 84px; border: 0; background: none; padding: 0; text-align: left; }
