@@ -74,7 +74,7 @@ export function setSideLength(pts, i, target) {
 }
 
 // Starting shapes for the usual areas, inside the garden's bounding box.
-export function presetArea(plan, kind) {
+export function presetArea(plan, kind, at = null) {
   const b = bounds(plan.outline);
   const bw = Math.min(1.5, Math.max(0.6, b.w * 0.22));
   const back = Math.min(2.5, Math.max(1, b.h * 0.2));
@@ -85,8 +85,11 @@ export function presetArea(plan, kind) {
     case "back": return { name: "Back border", poly: rect(b.x0, b.y1 - back, b.x1, b.y1) };
     case "middle": return { name: "Lawn", poly: rect(b.x0 + bw + 0.3, b.y0 + 1, b.x1 - bw - 0.3, b.y1 - back - 0.3) };
     default: {
-      const [cx, cy] = centroid(plan.outline);
-      return { name: "New area", poly: rect(cx - 1, cy - 1, cx + 1, cy + 1) };
+      // Small areas go in the middle of what's on screen, sized to the zoom.
+      const [cx, cy] = at ? [at.cx, at.cy] : centroid(plan.outline);
+      const side = Math.min(2.5, Math.max(0.4, (at?.span ?? 4) * 0.3));
+      const [w, h, name] = kind === "bed" ? [side * 1.4, side * 0.7, "Bed"] : kind === "patio" ? [side * 1.2, side, "Patio"] : [side, side, "New area"];
+      return { name, poly: rect(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2) };
     }
   }
 }
@@ -303,46 +306,99 @@ export function planSvg(plan, opts = {}, attrs = "") {
 /* ---------- interactive editor ---------- */
 // mode "shape": drag corners of the garden, tap + to add a corner, tap a side's length to type it.
 // mode "areas": tap an area to select it, then drag its corners the same way.
-export function mountPlanEditor(svg, plan, { mode, onSelect = () => {}, onSide = () => {}, onCorner = () => {}, onChange = () => {}, onCommit = () => {} }) {
+// Pinch (or the wheel) zooms; dragging an empty spot moves around. Handles keep their size on
+// screen, so zooming in lets you place corners precisely. Pass the same `view` object to keep
+// the zoom when the editor is redrawn.
+const MAX_ZOOM = 14;
+export function mountPlanEditor(svg, plan, { mode, view = {}, onSelect = () => {}, onSide = () => {}, onCorner = () => {}, onChange = () => {}, onCommit = () => {} }) {
   let selected = null;
-  let vb = viewBoxFor(plan);
-  let drag = null;
-  const k = () => Math.max(vb.w / Math.max(1, svg.clientWidth || 340), vb.h / Math.max(1, svg.clientHeight || 340));
+  let fit = viewBoxFor(plan);
+  view.z ||= 1;
+  if (view.cx == null) { view.cx = fit.x + fit.w / 2; view.cy = fit.y + fit.h / 2; }
+  const pointers = new Map();
+  let drag = null, gesture = null;
+  const size = () => ({ W: Math.max(1, svg.clientWidth || 340), H: Math.max(1, svg.clientHeight || 340) });
+  const unitsPerPx = (z = view.z) => { const { W, H } = size(); return Math.max(fit.w / W, fit.h / H) / z; };
+  const vb = () => { const w = fit.w / view.z, h = fit.h / view.z; return { x: view.cx - w / 2, y: view.cy - h / 2, w, h }; };
+  const k = () => unitsPerPx();
+  const clampView = () => {
+    view.z = Math.min(MAX_ZOOM, Math.max(1, view.z));
+    const v = vb();
+    const mx = Math.max(0, (fit.w - v.w) / 2), my = Math.max(0, (fit.h - v.h) / 2);
+    const fx = fit.x + fit.w / 2, fy = fit.y + fit.h / 2;
+    view.cx = Math.min(fx + mx, Math.max(fx - mx, view.cx));
+    view.cy = Math.min(fy + my, Math.max(fy - my, view.cy));
+  };
   const render = () => {
-    svg.setAttribute("viewBox", `${vb.x} ${vb.y} ${vb.w} ${vb.h}`);
+    clampView();
+    const v = vb();
+    svg.setAttribute("viewBox", `${v.x} ${v.y} ${v.w} ${v.h}`);
     svg.innerHTML = planSvgInner(plan, { k: k(), mode, selected });
   };
-  const toPlan = (ev) => {
+  const toSvg = (cx, cy) => {
     const pt = svg.createSVGPoint();
-    pt.x = ev.clientX; pt.y = ev.clientY;
-    const p = pt.matrixTransform(svg.getScreenCTM().inverse());
-    return [p.x, -p.y];
+    pt.x = cx; pt.y = cy;
+    return pt.matrixTransform(svg.getScreenCTM().inverse());
   };
+  const toPlan = (ev) => { const p = toSvg(ev.clientX, ev.clientY); return [p.x, -p.y]; };
+  const rectCentre = () => { const r = svg.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2]; };
+  // Keep the plan point `anchor` (svg units) under the screen point (sx, sy) at zoom z.
+  const placeAt = (anchor, sx, sy, z) => {
+    view.z = Math.min(MAX_ZOOM, Math.max(1, z));
+    const [rx, ry] = rectCentre(), u = unitsPerPx();
+    view.cx = anchor.x - (sx - rx) * u;
+    view.cy = anchor.y - (sy - ry) * u;
+    render();
+  };
+  const zoomAt = (sx, sy, factor) => placeAt(toSvg(sx, sy), sx, sy, view.z * factor);
   const target = () => (mode === "shape" ? plan.outline : plan.areas.find((a) => a.id === selected)?.poly);
+  const startPinch = () => {
+    const [a, b] = [...pointers.values()];
+    const mid = [(a.x + b.x) / 2, (a.y + b.y) / 2];
+    gesture = { type: "pinch", d0: Math.hypot(a.x - b.x, a.y - b.y) || 1, z0: view.z, anchor: toSvg(...mid) };
+  };
   svg.addEventListener("pointerdown", (ev) => {
+    svg.setPointerCapture(ev.pointerId);
+    pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+    if (pointers.size === 2) {
+      // A second finger: zoom instead (a corner being dragged stays where it got to).
+      if (drag?.moved) { drag = null; onCommit(); } else drag = null;
+      startPinch();
+      return;
+    }
+    if (pointers.size > 2) return;
     const el = ev.target.closest("[data-corner],[data-add],[data-side],[data-area]");
     const poly = target();
-    if (el?.dataset.side != null && poly) { onSide(Number(el.dataset.side)); return; }
+    if (el?.dataset.side != null && poly) { gesture = { type: "side", i: Number(el.dataset.side), sx: ev.clientX, sy: ev.clientY }; return; }
     if (el?.dataset.add != null && poly) {
       const i = Number(el.dataset.add), a = poly[i], b = poly[(i + 1) % poly.length];
       poly.splice(i + 1, 0, [r1((a[0] + b[0]) / 2), r1((a[1] + b[1]) / 2)]);
-      drag = { poly, i: i + 1, id: ev.pointerId };
-      svg.setPointerCapture(ev.pointerId);
+      drag = { poly, i: i + 1, id: ev.pointerId, moved: true };
       render(); onChange();
       return;
     }
     if (el?.dataset.corner != null && poly) {
       drag = { poly, i: Number(el.dataset.corner), id: ev.pointerId, start: [ev.clientX, ev.clientY], moved: false };
-      svg.setPointerCapture(ev.pointerId);
       return;
     }
-    if (mode === "areas") {
-      const id = el?.dataset.area || null;
-      selected = id;
-      render(); onSelect(id);
-    }
+    // Anything else: a tap selects (in areas mode); a drag moves the view.
+    const anchor = toSvg(ev.clientX, ev.clientY);
+    gesture = { type: "pan", id: ev.pointerId, sx: ev.clientX, sy: ev.clientY, anchor, moved: false, area: el?.dataset.area || null };
   });
   svg.addEventListener("pointermove", (ev) => {
+    if (!pointers.has(ev.pointerId)) return;
+    pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+    if (gesture?.type === "pinch" && pointers.size >= 2) {
+      const [a, b] = [...pointers.values()];
+      placeAt(gesture.anchor, (a.x + b.x) / 2, (a.y + b.y) / 2, gesture.z0 * (Math.hypot(a.x - b.x, a.y - b.y) / gesture.d0));
+      return;
+    }
+    if (gesture?.type === "pan" && ev.pointerId === gesture.id) {
+      if (!gesture.moved && Math.hypot(ev.clientX - gesture.sx, ev.clientY - gesture.sy) < 6) return;
+      gesture.moved = true;
+      if (view.z > 1.001) placeAt(gesture.anchor, ev.clientX, ev.clientY, view.z);
+      return;
+    }
     if (!drag || ev.pointerId !== drag.id) return;
     if (drag.start && !drag.moved && Math.hypot(ev.clientX - drag.start[0], ev.clientY - drag.start[1]) < 4) return;
     drag.moved = true;
@@ -355,27 +411,63 @@ export function mountPlanEditor(svg, plan, { mode, onSelect = () => {}, onSide =
       if (Math.abs(x - q[0]) < snap) x = q[0];
       if (Math.abs(y - q[1]) < snap) y = q[1];
     }
-    drag.poly[drag.i] = [r1(x), r1(y)];
+    // Finer steps when zoomed right in.
+    const step = view.z >= 4 ? 0.05 : 0.1;
+    drag.poly[drag.i] = [Math.round(x / step) * step, Math.round(y / step) * step].map((v) => +v.toFixed(2));
     render(); onChange();
   });
   const end = (ev) => {
+    if (!pointers.has(ev.pointerId)) return;
+    pointers.delete(ev.pointerId);
+    if (gesture?.type === "pinch") {
+      if (pointers.size === 1) {
+        // Carry on moving the view with the finger that's left.
+        const [[id, p]] = [...pointers.entries()];
+        gesture = { type: "pan", id, sx: p.x, sy: p.y, anchor: toSvg(p.x, p.y), moved: true };
+      } else if (!pointers.size) gesture = null;
+      return;
+    }
+    if (gesture?.type === "side") {
+      const g = gesture; gesture = null;
+      if (Math.hypot(ev.clientX - g.sx, ev.clientY - g.sy) < 8) onSide(g.i);
+      return;
+    }
+    if (gesture?.type === "pan" && ev.pointerId === gesture.id) {
+      const g = gesture; gesture = null;
+      if (!g.moved && mode === "areas" && ev.type === "pointerup") { selected = g.area; render(); onSelect(g.area); }
+      return;
+    }
     if (!drag || ev.pointerId !== drag.id) return;
     const d = drag;
     drag = null;
     // Tapping (not dragging) a corner offers to remove it.
     if (d.start && !d.moved) { onCorner(d.i); return; }
-    vb = viewBoxFor(plan);
+    fit = viewBoxFor(plan);
     render();
     onCommit();
   };
   svg.addEventListener("pointerup", end);
   svg.addEventListener("pointercancel", end);
+  svg.addEventListener("wheel", (ev) => { ev.preventDefault(); zoomAt(ev.clientX, ev.clientY, ev.deltaY < 0 ? 1.2 : 1 / 1.2); }, { passive: false });
   render();
   return {
-    render: () => { vb = viewBoxFor(plan); render(); },
+    render: () => { fit = viewBoxFor(plan); render(); },
     select: (id) => { selected = id; render(); },
     get selected() { return selected; },
-    target
+    target,
+    zoomBy: (f) => { const [rx, ry] = rectCentre(); zoomAt(rx, ry, f); },
+    fit: () => { view.z = 1; view.cx = fit.x + fit.w / 2; view.cy = fit.y + fit.h / 2; render(); },
+    // Zoom so an area fills most of the view.
+    zoomTo: (poly) => {
+      const b = bounds(poly);
+      const { W, H } = size();
+      const base = Math.max(fit.w / W, fit.h / H);
+      view.z = Math.min(MAX_ZOOM, Math.max(1, base / (Math.max((b.w + 1.2) / W, (b.h + 1.2) / H))));
+      view.cx = (b.x0 + b.x1) / 2; view.cy = -(b.y0 + b.y1) / 2;
+      render();
+    },
+    // What's on screen now, in plan metres: its centre and the smaller of its width and height.
+    visible: () => { const { W, H } = size(); const u = unitsPerPx(); return { cx: view.cx, cy: -view.cy, span: Math.min(W, H) * u }; }
   };
 }
 

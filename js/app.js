@@ -1903,7 +1903,11 @@ function runGuidedWalk({ garden = null } = {}) {
   return new Promise((resolve) => {
     const panel = $("#guide");
     const plan = garden?.plan ? JSON.parse(JSON.stringify(garden.plan)) : null;
-    const work = { plan, photos: {} };
+    const work = { plan, photos: {}, views: { shape: {}, areas: {} } };
+    const bindZoom = (editor) => panel.querySelectorAll("[data-z]").forEach((btn) => btn.addEventListener("click", () => {
+      const z = btn.dataset.z;
+      if (z === "fit") editor.fit(); else editor.zoomBy(z === "in" ? 1.6 : 1 / 1.6);
+    }));
     let step = plan ? "shape" : "size";
     let photoIndex = 0;
     document.body.classList.add("guiding");
@@ -1969,16 +1973,18 @@ function runGuidedWalk({ garden = null } = {}) {
       panel.innerHTML = `${top("Back")}
         <p class="eyebrow">Your garden plan</p>
         <h1>Shape it</h1>
-        <svg class="plan-editor" font-family="DM Sans, sans-serif" role="img" aria-label="Plan of the garden"></svg>
-        <div id="g-edit" class="plan-edit"><p class="muted" style="margin:0">Drag the orange corners to match your garden. Tap <b>+</b> to add a corner (for an L-shape or a kink). Tap a measurement to type the exact length.</p></div>
+        <div class="plan-wrap"><svg class="plan-editor" font-family="DM Sans, sans-serif" role="img" aria-label="Plan of the garden"></svg><div class="plan-zoom"><button class="round-tool" data-z="in" aria-label="Zoom in"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button><button class="round-tool" data-z="out" aria-label="Zoom out"><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button><button class="round-tool" data-z="fit" aria-label="Show the whole garden"><svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button></div></div>
+        <div id="g-edit" class="plan-edit"><p class="muted" style="margin:0">Drag the orange corners to match your garden. Tap <b>+</b> to add a corner (for an L-shape or a kink). Tap a measurement to type the exact length. Pinch or use the buttons to zoom; drag an empty spot to move around.</p></div>
         <button class="btn dark onboard-btn" id="g-next">Next: areas to photograph</button>`;
       const edit = panel.querySelector("#g-edit");
       const editor = mountPlanEditor(panel.querySelector(".plan-editor"), work.plan, {
         mode: "shape",
+        view: work.views.shape,
         onSide: (i) => sideEditor(edit, work.plan.outline, i, (v) => { work.plan.outline = setSideLength(work.plan.outline, i, v); settle(); renderShape(); }),
         onCorner: (i) => { if (work.plan.outline.length > 3) cornerEditor(edit, () => { work.plan.outline.splice(i, 1); settle(); renderShape(); }); },
         onCommit: () => settle()
       });
+      bindZoom(editor);
       panel.querySelector("#g-back").addEventListener("click", () => { step = "size"; render(); });
       panel.querySelector("#g-next").addEventListener("click", () => {
         if (Math.abs(signedArea(work.plan.outline)) < 1) { toast("The garden shape looks too small"); return; }
@@ -1990,14 +1996,14 @@ function runGuidedWalk({ garden = null } = {}) {
 
     const renderAreas = (selectId = null) => {
       const usedNames = new Set(work.plan.areas.map((a) => a.name));
-      const presets = [["left", "Left border"], ["right", "Right border"], ["back", "Back border"], ["middle", "Lawn"], ["other", "Other area"]];
+      const presets = [["left", "Left border"], ["right", "Right border"], ["back", "Back border"], ["middle", "Lawn"], ["bed", "Bed"], ["patio", "Patio"], ["other", "Other area"]];
       panel.innerHTML = `${top("Back")}
         <p class="eyebrow">Your garden plan</p>
         <h1>Areas to <em>photograph</em></h1>
-        <p class="muted" style="margin:0">Tap an area to rename it or drag its corners; tap + below to add more. Borders are photographed in 2–3 m sections for close-up detail. Overlaps are trimmed for you.</p>
-        <svg class="plan-editor" font-family="DM Sans, sans-serif" role="img" aria-label="Plan of the garden with areas"></svg>
+        <p class="muted" style="margin:0">Tap an area to rename it or drag its corners; add more below. Pinch to zoom in for small areas. Borders are photographed in 2–3 m sections for close-up detail. Overlaps are trimmed for you.</p>
+        <div class="plan-wrap"><svg class="plan-editor" font-family="DM Sans, sans-serif" role="img" aria-label="Plan of the garden with areas"></svg><div class="plan-zoom"><button class="round-tool" data-z="in" aria-label="Zoom in"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button><button class="round-tool" data-z="out" aria-label="Zoom out"><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button><button class="round-tool" data-z="fit" aria-label="Show the whole garden"><svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button></div></div>
         <div id="g-edit" class="plan-edit"></div>
-        <div class="chip-row">${presets.filter(([k, label]) => k === "other" || !usedNames.has(label)).map(([k, label]) => `<button class="btn small" data-preset="${k}">+ ${label}</button>`).join("")}</div>
+        <div class="chip-row">${presets.filter(([k, label]) => ["other", "bed"].includes(k) || !usedNames.has(label)).map(([k, label]) => `<button class="btn small" data-preset="${k}">+ ${label}</button>`).join("")}</div>
         <button class="btn dark onboard-btn" id="g-next" ${work.plan.areas.length ? "" : "disabled"}>Next: take ${shotsFor(work.plan).length || ""} photo${shotsFor(work.plan).length === 1 ? "" : "s"}</button>`;
       const edit = panel.querySelector("#g-edit");
       const areaSummary = (a) => { const sh = shotsOf(a); return `${describeSize(a.poly)} · ${sh.length > 1 ? `${sh.length} photos of ${fmtM(sh[0].length)}` : "1 photo"}`; };
@@ -2005,15 +2011,17 @@ function runGuidedWalk({ garden = null } = {}) {
       const showSelected = (id) => {
         const a = work.plan.areas.find((x) => x.id === id);
         if (!a) { edit.innerHTML = `<p class="muted" style="margin:0">${work.plan.areas.length ? "Tap an area on the plan to change it." : "Add the areas you'd like to photograph."}</p>`; return; }
-        edit.innerHTML = `<div class="plan-edit-row"><label class="field grow">Name<input type="text" id="g-aname" value="${esc(a.name)}" /></label><button class="btn small ghost" id="g-adel">Remove</button></div>
+        edit.innerHTML = `<div class="plan-edit-row"><label class="field grow">Name<input type="text" id="g-aname" value="${esc(a.name)}" /></label><button class="btn small" id="g-azoom">Zoom in</button><button class="btn small ghost" id="g-adel">Remove</button></div>
           <div class="plan-edit-row" style="margin-top:6px;align-items:center"><span class="grow muted" id="g-asize">${areaSummary(a)}</span><button class="btn small" id="g-asec">${isSectioned(a) ? "One photo instead" : "Photograph in sections"}</button></div>`;
         const name = edit.querySelector("#g-aname");
         name.addEventListener("input", () => { a.name = name.value.trim() || "Unnamed area"; editor.render(); edit.querySelector("#g-asize").textContent = areaSummary(a); edit.querySelector("#g-asec").textContent = isSectioned(a) ? "One photo instead" : "Photograph in sections"; nextLabel(); });
+        edit.querySelector("#g-azoom").addEventListener("click", () => editor.zoomTo(a.poly));
         edit.querySelector("#g-asec").addEventListener("click", () => { a.sections = !isSectioned(a); renderAreas(a.id); });
         edit.querySelector("#g-adel").addEventListener("click", () => { work.plan.areas = work.plan.areas.filter((x) => x.id !== a.id); renderAreas(); });
       };
       const editor = mountPlanEditor(panel.querySelector(".plan-editor"), work.plan, {
         mode: "areas",
+        view: work.views.areas,
         onSelect: showSelected,
         onChange: () => { const s = edit.querySelector("#g-asize"); const a = work.plan.areas.find((x) => x.id === editor.selected); if (s && a) s.textContent = areaSummary(a); },
         onCommit: () => { const id = editor.selected; settle(id ? [id] : []); renderAreas(work.plan.areas.some((x) => x.id === id) ? id : null); },
@@ -2027,16 +2035,23 @@ function runGuidedWalk({ garden = null } = {}) {
           if (a && a.poly.length > 3) cornerEditor(edit, () => { a.poly.splice(i, 1); settle([a.id]); renderAreas(a.id); });
         }
       });
+      bindZoom(editor);
       if (selectId) editor.select(selectId);
       showSelected(selectId);
       panel.querySelectorAll("[data-preset]").forEach((btn) => btn.addEventListener("click", () => {
-        const a = { id: uid("parea"), ...presetArea(work.plan, btn.dataset.preset) };
-        // A new area fits around the ones already there.
-        settle(work.plan.areas.map((x) => x.id));
+        const kind = btn.dataset.preset;
+        // Borders and the lawn fit around what's there; a bed, patio or other area goes in the
+        // middle of the screen and the areas under it make room.
+        const small = ["bed", "patio", "other"].includes(kind);
+        const a = { id: uid("parea"), ...presetArea(work.plan, kind, small ? editor.visible() : null) };
+        if (small) {
+          const taken = new Set(work.plan.areas.map((x) => x.name));
+          for (let n = 2; taken.has(a.name); n++) a.name = `${a.name.replace(/ \d+$/, "")} ${n}`;
+        }
         work.plan.areas.push(a);
-        const notes = settleAreas(work.plan, work.plan.areas.filter((x) => x !== a).map((x) => x.id));
+        const notes = settleAreas(work.plan, small ? [a.id] : work.plan.areas.filter((x) => x !== a).map((x) => x.id));
         if (!work.plan.areas.includes(a)) { toast(`No room for ${a.name}: move or shrink an area first`); renderAreas(); return; }
-        if (notes.length) toast(`Fitted ${a.name} around your other areas`);
+        if (notes.length) toast(small ? `Made room for ${a.name}` : `Fitted ${a.name} around your other areas`);
         renderAreas(a.id);
       }));
       panel.querySelector("#g-back").addEventListener("click", () => { step = "shape"; render(); });

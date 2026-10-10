@@ -133,6 +133,9 @@ body.guiding .app, body.guiding .onboarding-panel:not(.guide-panel) { display: n
 .guide-dots i.now { background: var(--terra); }
 .plan-editor, .plan-svg { stroke: none; stroke-width: 0; fill: none; }
 .plan-editor { width: 100%; height: 44dvh; flex: none; touch-action: none; user-select: none; -webkit-user-select: none; background: var(--paper-2); border-radius: 14px; }
+.plan-wrap { position: relative; flex: none; }
+.plan-zoom { position: absolute; right: 8px; top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.plan-zoom .round-tool { width: 38px; height: 38px; }
 .plan-svg { width: 100%; height: auto; max-height: 52dvh; display: block; }
 .guide-plan { max-height: 34dvh; flex: none; margin: 4px 0; }
 .plan-svg .tappable { cursor: pointer; }
