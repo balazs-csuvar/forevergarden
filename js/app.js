@@ -497,10 +497,12 @@ function setupStageGestures() {
   let gesture = null;
   let lastTap = 0;
   let drawing = null;
+  let sculpt = null;
   stage.addEventListener("pointerdown", (event) => {
     if (event.target.closest(".pin, .hotspot, .round-tool, .banner")) return;
     stage.setPointerCapture(event.pointerId);
     if (ui.mode?.type === "draw") { drawing = [sceneRel(event)]; ui.draft = { seg: { poly: [] } }; return; }
+    if (!pointers.size && !ui.mode) { sculpt = startSculpt(event); if (sculpt) return; }
     pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
     if (pointers.size === 1) gesture = { type: "pan", sx: event.clientX, sy: event.clientY, vx: view.x, vy: view.y, moved: false };
     else if (pointers.size === 2) {
@@ -519,6 +521,7 @@ function setupStageGestures() {
       }
       return;
     }
+    if (sculpt) { if (event.pointerId === sculpt.id) moveSculpt(sculpt, event); return; }
     if (!pointers.has(event.pointerId) || !gesture) return;
     pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
     if (gesture.type === "pan") {
@@ -532,6 +535,15 @@ function setupStageGestures() {
   });
   const end = (event) => {
     if (drawing) { finishDrawing(drawing); drawing = null; return; }
+    if (sculpt) {
+      if (event.pointerId !== sculpt.id) return;
+      const s = sculpt;
+      sculpt = null;
+      // Barely moved: treat it as an ordinary tap.
+      if (!s.moved) { if (event.type === "pointerup") handleStageTap(event); return; }
+      finishSculpt();
+      return;
+    }
     if (!pointers.has(event.pointerId)) return;
     pointers.delete(event.pointerId);
     if (gesture?.type === "pan" && !gesture.moved && event.type === "pointerup") {
@@ -582,13 +594,7 @@ function finishDrawing(points) {
   setMode(null);
   if (points.length < 6) { ui.draft = null; renderOverlay(); toast("Draw all the way round the plant"); return; }
   const poly = points.map(({ x, y }) => [+Math.min(1, Math.max(0, x)).toFixed(4), +Math.min(1, Math.max(0, y)).toFixed(4)]);
-  let area = 0, cx = 0, cy = 0;
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    const c = poly[j][0] * poly[i][1] - poly[i][0] * poly[j][1];
-    area += c; cx += (poly[j][0] + poly[i][0]) * c; cy += (poly[j][1] + poly[i][1]) * c;
-  }
-  area /= 2;
-  const seg = Math.abs(area) > 1e-5 ? { poly, cx: cx / (6 * area), cy: cy / (6 * area), area: Math.abs(area), r: Math.sqrt(Math.abs(area) / Math.PI) } : null;
+  const seg = polyStats(poly);
   if (!seg) { ui.draft = null; renderOverlay(); return; }
   if (target) {
     const p = state.placements.find((item) => item.id === target);
@@ -600,6 +606,84 @@ function finishDrawing(points) {
   ui.draft = { x: seg.cx, y: seg.cy, looseness: 1, seg, spotId: currentSpot().id, drawn: true };
   renderOverlay();
   openTagSheet();
+}
+
+// Area, centre and radius of an outline polygon (normalised 0–1 coordinates).
+function polyStats(poly) {
+  let area = 0, cx = 0, cy = 0;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const c = poly[j][0] * poly[i][1] - poly[i][0] * poly[j][1];
+    area += c; cx += (poly[j][0] + poly[i][0]) * c; cy += (poly[j][1] + poly[i][1]) * c;
+  }
+  area /= 2;
+  if (Math.abs(area) < 1e-5) return null;
+  return { poly, cx: cx / (6 * area), cy: cy / (6 * area), area: Math.abs(area), r: Math.sqrt(Math.abs(area) / Math.PI) };
+}
+
+/* ---------- push / pull the draft outline with a finger ----------
+   Touch on or near the edge of the outline being set, then drag: outward grows it,
+   inward pulls it back. Points near the finger follow it most, fading off smoothly. */
+const SCULPT_GRAB_PX = 34;   // how close to the edge a touch must land to grab it
+const SCULPT_RADIUS_PX = 55; // how wide a stretch of edge follows the finger
+
+function startSculpt(event) {
+  const poly = ui.draft?.seg?.poly;
+  if (!poly || poly.length < 3 || ui.draft.spotId !== currentSpot().id) return null;
+  const rect = $("#scene").getBoundingClientRect();
+  const W = rect.width, H = rect.height;
+  const px = event.clientX - rect.left, py = event.clientY - rect.top;
+  // Even spacing so the edge bends smoothly wherever it's grabbed.
+  const pts = resamplePoly(poly.map(([x, y]) => [x * W, y * H]), 5, 800);
+  let near = Infinity;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) near = Math.min(near, distToSegment(px, py, pts[j], pts[i]));
+  if (near > SCULPT_GRAB_PX) return null;
+  const R = SCULPT_RADIUS_PX;
+  const weights = pts.map(([x, y]) => Math.exp(-((x - px) ** 2 + (y - py) ** 2) / (R * R)));
+  $("#stage").setPointerCapture(event.pointerId);
+  return { id: event.pointerId, sx: event.clientX, sy: event.clientY, pts, weights, W, H, moved: false };
+}
+
+function moveSculpt(s, event) {
+  const dx = event.clientX - s.sx, dy = event.clientY - s.sy;
+  if (!s.moved && Math.hypot(dx, dy) < 6) return;
+  s.moved = true;
+  ui.draft.seg.poly = s.pts.map(([x, y], i) => [
+    Math.min(1, Math.max(0, (x + dx * s.weights[i]) / s.W)),
+    Math.min(1, Math.max(0, (y + dy * s.weights[i]) / s.H)),
+  ]);
+  renderOverlay();
+}
+
+function finishSculpt() {
+  const d = ui.draft;
+  const stats = polyStats(d.seg.poly.map(([x, y]) => [+x.toFixed(4), +y.toFixed(4)]));
+  if (!stats) return;
+  // Keep the tap point and looseness so Tighter/Looser still re-run from the same place.
+  d.seg = { ...d.seg, ...stats };
+  renderOverlay();
+}
+
+function resamplePoly(pts, step, maxPts) {
+  let len = 0;
+  for (let i = 0; i < pts.length; i++) { const a = pts[i], b = pts[(i + 1) % pts.length]; len += Math.hypot(b[0] - a[0], b[1] - a[1]); }
+  step = Math.max(step, len / maxPts);
+  const out = [];
+  let carry = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length];
+    const seg = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    let t = carry;
+    while (t < seg) { const f = t / seg; out.push([a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f]); t += step; }
+    carry = t - seg;
+  }
+  return out.length >= 3 ? out : pts;
+}
+
+function distToSegment(px, py, a, b) {
+  const vx = b[0] - a[0], vy = b[1] - a[1];
+  const l2 = vx * vx + vy * vy;
+  const t = l2 ? Math.max(0, Math.min(1, ((px - a[0]) * vx + (py - a[1]) * vy) / l2)) : 0;
+  return Math.hypot(px - (a[0] + vx * t), py - (a[1] + vy * t));
 }
 
 function discardDraft() {
@@ -641,7 +725,7 @@ function openTagSheet() {
   sheet.classList.add("compact");
   openSheet(`<p class="eyebrow">New plant</p><h2>What's this plant?</h2>
     <div class="outline-tools">
-      <span class="muted">Outline</span>
+      <span class="muted">Outline · drag its edge to adjust</span>
       ${d.drawn ? "" : `<button class="btn small" data-o="tighter">Tighter</button><button class="btn small" data-o="looser">Looser</button>`}
       <button class="btn small" data-o="draw">Draw it myself</button>
     </div>
