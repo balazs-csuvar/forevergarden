@@ -293,7 +293,9 @@ function contourLines(A, w, h, share) {
 }
 
 // Share of the picture drawn in ink: outlines of masses, and finer detail lines.
-const INK_SHARE = { mass: 0.045, detail: 0.05 };
+const INK_SHARE = { mass: 0.045, detail: 0.06 };
+// How closely the drawing follows the photo: pencil shading strength, colour strength, colour coverage.
+const FIDELITY = { tone: 0.38, colour: 0.58, cover: 0.6 };
 
 // Stretch exposure so a dim or bright photo maps to the same tonal range before drawing.
 function normalizeExposure(src, w, h) {
@@ -312,7 +314,7 @@ function normalizeExposure(src, w, h) {
 }
 
 // Garden-designer sketch: ink linework + hatching carry the detail, a loose watercolour tint carries colour.
-function paint(src, w, h, month, pins, seed, photoMonth = 7) {
+function paint(src, w, h, month, pins, seed, photoMonth = 7, seamless = false) {
   const N = w * h;
   const k = w / 900;
   const nz = makeNoise(seed || 7);
@@ -346,7 +348,7 @@ function paint(src, w, h, month, pins, seed, photoMonth = 7) {
   const T = gaussian(L, w, h, 2.5 * k);
 
   // Soft, misregistered colour for the tint.
-  const sig = 3 * k;
+  const sig = 2 * k;
   const cR = gaussian(kR, w, h, sig), cG = gaussian(kG, w, h, sig), cB = gaussian(kB, w, h, sig);
 
   const out = new Uint8ClampedArray(N * 4);
@@ -375,7 +377,8 @@ function paint(src, w, h, month, pins, seed, photoMonth = 7) {
       // Ragged sheet: colour stops short, ink runs closer to the edge.
       const edgeDist = Math.min(x, w - 1 - x, y, h - 1 - y) / border;
       const jag = (nz.fbm(x * 0.012, y * 0.012, 4) - 0.5) * 1.8 + (nz.fbm(x * 0.07, y * 0.07, 2) - 0.5) * 0.4;
-      const d = edgeDist + jag;
+      // Seamless: no ragged paper edge, so neighbouring sections can be joined into one strip.
+      const d = seamless ? 9 : edgeDist + jag;
       const colourMask = smoothstep(0.8, 1.6, d);
       const inkMask = smoothstep(0.45, 0.85, d);
 
@@ -385,13 +388,13 @@ function paint(src, w, h, month, pins, seed, photoMonth = 7) {
       let r = sample(cR, w, h, x + dx, y + dy), g = sample(cG, w, h, x + dx, y + dy), b = sample(cB, w, h, x + dx, y + dy);
       const lum = 0.3 * r + 0.59 * g + 0.11 * b;
       r = lum + (r - lum) * 1.5; g = lum + (g - lum) * 1.5; b = lum + (b - lum) * 1.5;
-      const lift = (c) => 1 - Math.min(1, Math.max(0, 1 - c)) * 0.45;
+      const lift = (c) => 1 - Math.min(1, Math.max(0, 1 - c)) * FIDELITY.colour;
       r = lift(r); g = lift(g); b = lift(b);
       // Colour goes where the planting is (saturated areas); paving and soil stay mostly paper.
       const mx = Math.max(cR[i], cG[i], cB[i]), mn = Math.min(cR[i], cG[i], cB[i]);
       const chroma = mx - mn;
       const patch = nz.fbm(x * 0.004 / k + 7, y * 0.004 / k, 3);
-      let m = smoothstep(0.04, 0.14, chroma) * 0.6 + 0.4;
+      let m = smoothstep(0.04, 0.14, chroma) * (1 - FIDELITY.cover) + FIDELITY.cover;
       m *= smoothstep(0.2, 0.45, patch + 0.12);
       m *= 1 - smoothstep(0.75, 0.92, t) * 0.8;
       m *= colourMask;
@@ -405,6 +408,10 @@ function paint(src, w, h, month, pins, seed, photoMonth = 7) {
       let fr = paper[0] * fibre * (1 - m * (1 - r)) * (1 - rim) * gran;
       let fg = paper[1] * fibre * (1 - m * (1 - g)) * (1 - rim) * gran;
       let fb = paper[2] * fibre * (1 - m * (1 - b)) * (1 - rim) * gran;
+      // Pencil shading that follows the photo's own light and dark, so forms and depth read true.
+      const grain = nz.fbm(((x * 0.8 + y * 0.45) * 0.35) / k, ((y * 0.8 - x * 0.45) * 0.06) / k, 2);
+      const shadeAmt = FIDELITY.tone * smoothstep(0.82, 0.12, t) * (0.7 + 0.3 * grain) * (1 - gone) * inkMask;
+      fr *= 1 - shadeAmt; fg *= 1 - shadeAmt * 0.97; fb *= 1 - shadeAmt * 0.93;
 
       // Ink pressure varies a little, like a fineliner.
       const pressure = 0.75 + 0.35 * nz.noise(x * 0.03 / k + 3, y * 0.03 / k);
@@ -423,9 +430,9 @@ function paint(src, w, h, month, pins, seed, photoMonth = 7) {
 
 if (typeof self !== "undefined" && typeof self.postMessage === "function" && typeof module === "undefined") {
   self.onmessage = (event) => {
-    const { id, width, height, data, month, pins, seed, photoMonth } = event.data;
+    const { id, width, height, data, month, pins, seed, photoMonth, seamless } = event.data;
     try {
-      const out = paint(new Uint8ClampedArray(data), width, height, month, pins, seed, photoMonth);
+      const out = paint(new Uint8ClampedArray(data), width, height, month, pins, seed, photoMonth, seamless);
       self.postMessage({ id, data: out.buffer }, [out.buffer]);
     } catch (error) {
       self.postMessage({ id, error: String(error && error.message || error) });

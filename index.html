@@ -27,6 +27,22 @@
       <p class="muted onboard-note">Your photos and plans stay on this phone. Nothing is uploaded unless you use the optional Claude features.</p>
     </section>
     <section class="onboarding-panel guide-panel" id="guide" hidden></section>
+    <section class="street" id="street" hidden aria-label="Walk through the garden">
+      <div class="sv-stage" id="sv-stage"><div class="sv-strip" id="sv-strip"></div><div class="sv-nav" id="sv-nav"></div></div>
+      <div class="sv-top">
+        <button class="sv-btn" id="sv-close" aria-label="Close walk"><svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+        <div class="sv-title"><span class="hand" id="sv-name"></span><small id="sv-sub"></small></div>
+        <button class="sv-btn" id="sv-back" aria-label="Go back" hidden><svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg></button>
+      </div>
+      <div class="sv-map" id="sv-map" aria-label="Where you are"></div>
+      <div class="sv-bottom">
+        <button class="sv-btn" id="sv-prev-month" aria-label="Previous month"><svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg></button>
+        <span class="sv-month" id="sv-month"></span>
+        <button class="sv-btn" id="sv-next-month" aria-label="Next month"><svg viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg></button>
+        <button class="sv-pill" id="sv-mode"></button>
+      </div>
+      <div class="stage-loading hidden" id="sv-loading"><span class="brush"></span><span>Sketching…</span></div>
+    </section>
     <div class="app">
       <header class="topbar">
         <div class="brand"><img src="icons/icon-192.png" alt="" class="brand-icon" /><span id="garden-name">ForeverGarden</span></div>
@@ -40,6 +56,7 @@
           <div class="walk-head">
             <button class="icon-btn small" id="back-btn" aria-label="Go back" hidden><svg viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></svg></button>
             <div class="walk-title"><span class="hand" id="spot-name">From the patio</span><small id="spot-sub"></small></div>
+            <button class="pill" id="sv-open" aria-label="Walk through the garden"><svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="2"/><path d="m9 22 2-6-2-3 1-4h4l1 4 3 2M11 16l3 6M10 9l-3 3"/></svg>Walk</button>
             <button class="pill" id="edit-toggle" aria-pressed="false"><svg viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16v4Z"/></svg>Edit</button>
           </div>
           <div class="stage" id="stage">

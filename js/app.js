@@ -7,10 +7,11 @@ import { paintPlant, paintExistingSeason, plantState, seasonDelta } from "./pain
 import { photoTakenOn } from "./exif.js";
 import { MONTHS, MON, monthRange, nearestArea, bloomCoverage, speciesFor, recommendFor, describeConditions, fitsConditions } from "./recommend.js";
 import * as ai from "./ai.js";
+import { overlapOffset } from "./align.js";
 import { loadWeather, syncWeather, findPlace, monthSummary, lastDays, isoDay } from "./weather.js";
-import { newPlan, bounds, signedArea, centroid, describeSize, setSideLength, presetArea, cameraFor, linkSpot, fmtM, planSvg, mountPlanEditor, settleAreas, shotsFor, shotsOf, isSectioned, planPoint, neighbourSpotIds, mountCameraEditor } from "./guided.js";
+import { newPlan, bounds, signedArea, centroid, describeSize, setSideLength, presetArea, cameraFor, linkSpot, fmtM, planSvg, mountPlanEditor, settleAreas, shotsFor, shotsOf, isSectioned, planPoint, neighbourSpotIds, mountCameraEditor, shotOfSpot } from "./guided.js";
 
-const ENGINE = "sk5";
+const ENGINE = "sk6";
 const WORK_SIZE = 1200;
 const SEASON_COLORS = ["#a7b6c8", "#b3c0c9", "#c3d39a", "#a6cf7a", "#8cc46a", "#e2a6bd", "#e6c25a", "#dba94a", "#c99a4a", "#c9773e", "#a86a48", "#9aa8b8"];
 const LIGHT_LABEL = { full: "Full sun (6h+)", part: "Part shade (3–6h)", shade: "Shade (<3h)" };
@@ -116,12 +117,12 @@ worker.onmessage = (event) => {
   if (event.data.error) job.reject(new Error(event.data.error));
   else job.resolve(event.data.data);
 };
-function paintInWorker(imageData, month, pins, photoMonth) {
+function paintInWorker(imageData, month, pins, photoMonth, seamless = false) {
   return new Promise((resolve, reject) => {
     const id = nextJob++;
     jobs.set(id, { resolve, reject });
     const copy = imageData.data.slice().buffer;
-    worker.postMessage({ id, width: imageData.width, height: imageData.height, data: copy, month, pins, photoMonth, seed: 7 }, [copy]);
+    worker.postMessage({ id, width: imageData.width, height: imageData.height, data: copy, month, pins, photoMonth, seamless, seed: 7 }, [copy]);
   });
 }
 
@@ -186,7 +187,7 @@ async function spotPixels(spot, photoId = bestPhoto(spot, ui.month).photoId) {
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
   const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  if (pixelCache.size > 3) pixelCache.delete(pixelCache.keys().next().value);
+  if (pixelCache.size > 8) pixelCache.delete(pixelCache.keys().next().value);
   pixelCache.set(photoId, data);
   return data;
 }
@@ -209,15 +210,15 @@ function hashStr(text) {
   for (let i = 0; i < text.length; i += 1) h = (Math.imul(31, h) + text.charCodeAt(i)) | 0;
   return (h >>> 0).toString(36);
 }
-const baseKey = (spot, month) => {
+const baseKey = (spot, month, seamless = false) => {
   const ph = bestPhoto(spot, month);
-  return `wc:${spot.id}:${ph.photoId}:${photoMonthOf(ph)}:${month}:${hashStr(JSON.stringify(pinsFor(spot, month, photoMonthOf(ph))))}:${ENGINE}`;
+  return `wc:${spot.id}:${ph.photoId}:${photoMonthOf(ph)}:${month}:${hashStr(JSON.stringify(pinsFor(spot, month, photoMonthOf(ph))))}:${ENGINE}${seamless ? ":s" : ""}`;
 };
 
 const baseCache = new Map();
 const inflight = new Map();
-async function getBase(spot, month, priority = 1) {
-  const key = baseKey(spot, month);
+async function getBase(spot, month, priority = 1, seamless = false) {
+  const key = baseKey(spot, month, seamless);
   if (baseCache.has(key)) return baseCache.get(key);
   if (inflight.has(key)) {
     const queued = queuedByKey.get(key);
@@ -230,7 +231,7 @@ async function getBase(spot, month, priority = 1) {
     return schedule(key, async () => {
       const ph = bestPhoto(spot, month);
       const px = await spotPixels(spot, ph.photoId);
-      const buffer = await paintInWorker(px, month, pinsFor(spot, month, photoMonthOf(ph)), photoMonthOf(ph));
+      const buffer = await paintInWorker(px, month, pinsFor(spot, month, photoMonthOf(ph)), photoMonthOf(ph), seamless);
       const canvas = document.createElement("canvas");
       canvas.width = px.width;
       canvas.height = px.height;
@@ -267,8 +268,8 @@ function drawPlants(ctx, W, H, spot, month, { highlight } = {}) {
   }
 }
 
-async function composeScene(spot, month, priority) {
-  const base = await getBase(spot, month, priority);
+async function composeScene(spot, month, priority, seamless = false) {
+  const base = await getBase(spot, month, priority, seamless);
   const canvas = document.createElement("canvas");
   canvas.width = base.width;
   canvas.height = base.height;
@@ -2314,6 +2315,296 @@ async function openViewPhotos(spot) {
   });
 }
 
+/* ---------- street view walk ----------
+   Full-screen walk: a border's sections are joined into one strip (overlaps matched from the photos)
+   that you swipe along; arrows lead to the areas ahead, turn buttons to views facing another way
+   from about the same spot, and a mini-map shows where you stand. Built from the garden plan. */
+const sv = { spotId: null, sketch: true, pan: 0, chain: [], layout: [], token: 0, history: [], total: 0 };
+const SV_HALF_FOV = (65 / 2) * (Math.PI / 180);
+
+function poseOf(spot) {
+  if (!state.plan || !spot?.planAreaId) return null;
+  const sh = shotOfSpot(state.plan, spot);
+  return sh ? { ...cameraFor(state.plan, sh), target: centroid(sh.poly), areaName: sh.area.name } : null;
+}
+
+function chainOf(spot) {
+  if (!spot.planAreaId || spot.planSection == null) return [spot];
+  const same = state.spots.filter((s) => s.planAreaId === spot.planAreaId && s.planSection != null).sort((a, b) => a.planSection - b.planSection);
+  if (same.length < 2) return [spot];
+  // Left to right as seen in the photos.
+  const p0 = poseOf(same[0]), p1 = poseOf(same[1]);
+  if (p0 && p1) {
+    const t = [p1.target[0] - p0.x, p1.target[1] - p0.y];
+    if (t[0] * p0.dir[1] - t[1] * p0.dir[0] < 0) same.reverse();
+  }
+  return same;
+}
+
+async function alignPair(a, b) {
+  const pa = bestPhoto(a, ui.month), pb = bestPhoto(b, ui.month);
+  const key = `${pa.photoId}|${pb.photoId}`;
+  state.align ||= {};
+  if (state.align[key]) return state.align[key];
+  const r = overlapOffset(await spotPixels(a, pa.photoId), await spotPixels(b, pb.photoId));
+  // A weak match is more likely wrong than right: assume a modest overlap instead.
+  const res = r.score >= 0.3 ? r : { dx: 0.88, dy: 0, score: r.score, guessed: true };
+  state.align[key] = res;
+  save();
+  return res;
+}
+
+function svOpen(spotId = ui.spotId) {
+  ui.playing = false;
+  closeSheet();
+  sv.history = [];
+  $("#street").hidden = false;
+  document.body.classList.add("walking");
+  svGo(spotId, { animate: null });
+}
+
+function svClose() {
+  $("#street").hidden = true;
+  document.body.classList.remove("walking");
+  if (sv.spotId && sv.spotId !== ui.spotId) { ui.spotId = sv.spotId; persistUi(); }
+  switchView("walk");
+}
+
+async function svGo(spotId, { animate = null, origin = null, keepHistory = false } = {}) {
+  const spot = state.spots.find((s) => s.id === spotId);
+  if (!spot) return;
+  const strip = $("#sv-strip");
+  if (animate && !reducedMotion) {
+    if (animate === "forward") {
+      strip.style.transformOrigin = `${(origin?.x ?? 0.5) * innerWidth + sv.pan}px 60%`;
+      strip.classList.add("leave-forward");
+      strip.style.transform = `translateX(${-sv.pan}px) scale(1.7)`;
+    } else {
+      strip.classList.add("anim");
+      strip.style.opacity = "0";
+      strip.style.transform = `translateX(${-sv.pan + (animate === "left" ? 1 : animate === "right" ? -1 : 0) * innerWidth * 0.45}px)`;
+    }
+    await wait(430);
+  }
+  if (!keepHistory && sv.spotId && sv.spotId !== spotId) sv.history.push(sv.spotId);
+  sv.spotId = spotId;
+  await svBuild(spot);
+  strip.classList.remove("leave-forward", "anim");
+  strip.style.transformOrigin = "";
+  if (animate && !reducedMotion) {
+    strip.style.opacity = "0";
+    strip.style.transform = `translateX(${-sv.pan + (animate === "left" ? -1 : animate === "right" ? 1 : 0) * innerWidth * 0.3}px) scale(${animate === "forward" ? 0.94 : 1})`;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      strip.classList.add("anim");
+      strip.style.opacity = "1";
+      strip.style.transform = `translateX(${-sv.pan}px)`;
+      setTimeout(() => strip.classList.remove("anim"), 480);
+    }));
+  } else {
+    strip.style.opacity = "1";
+    strip.style.transform = `translateX(${-sv.pan}px)`;
+  }
+}
+
+async function svBuild(spot) {
+  const token = ++sv.token;
+  const stage = $("#sv-stage"), strip = $("#sv-strip");
+  sv.chain = chainOf(spot);
+  const H = stage.clientHeight, W = stage.clientWidth;
+  // Photos first (fast), so the strip can be laid out and matched.
+  const pix = await Promise.all(sv.chain.map((s) => spotPixels(s, bestPhoto(s, ui.month).photoId)));
+  if (token !== sv.token) return;
+  const offsets = [];
+  for (let i = 1; i < sv.chain.length; i += 1) offsets.push(await alignPair(sv.chain[i - 1], sv.chain[i]));
+  if (token !== sv.token) return;
+  sv.layout = [];
+  let x = 0, y = 0;
+  pix.forEach((px, i) => {
+    const w = (H * px.width) / px.height;
+    if (i > 0) { const prev = sv.layout[i - 1]; x = prev.x + offsets[i - 1].dx * prev.w; y = prev.y + offsets[i - 1].dy * H; }
+    sv.layout.push({ spot: sv.chain[i], x, y, w, overlap: i > 0 ? sv.layout[i - 1].x + sv.layout[i - 1].w - x : 0 });
+  });
+  sv.total = sv.layout.length ? sv.layout[sv.layout.length - 1].x + sv.layout[sv.layout.length - 1].w : W;
+  strip.style.width = `${sv.total}px`;
+  strip.innerHTML = sv.layout.map((l, i) => {
+    const fade = l.overlap > 0 ? `mask-image:linear-gradient(to right, transparent 0, #000 ${Math.round(l.overlap * 0.7)}px);-webkit-mask-image:linear-gradient(to right, transparent 0, #000 ${Math.round(l.overlap * 0.7)}px);` : "";
+    return `<div class="sv-img" data-i="${i}" style="left:${l.x}px;top:${l.y}px;width:${l.w}px;height:${H}px;${fade}"><canvas></canvas></div>`;
+  }).join("");
+  pix.forEach((px, i) => {
+    const c = strip.querySelector(`[data-i="${i}"] canvas`);
+    c.width = px.width; c.height = px.height;
+    c.getContext("2d").putImageData(px, 0, 0);
+  });
+  const cur = sv.layout.find((l) => l.spot.id === spot.id) || sv.layout[0];
+  sv.pan = svClamp(cur.x + cur.w / 2 - W / 2);
+  strip.style.transform = `translateX(${-sv.pan}px)`;
+  svChrome();
+  if (sv.sketch) {
+    const seamless = sv.layout.length > 1;
+    $("#sv-loading").classList.toggle("hidden", sv.layout.every((l) => baseCache.has(baseKey(l.spot, ui.month, seamless))));
+    const order = [...sv.layout].sort((a, b) => Math.abs(a.x + a.w / 2 - sv.pan - W / 2) - Math.abs(b.x + b.w / 2 - sv.pan - W / 2));
+    for (const l of order) {
+      try {
+        const canvas = await composeScene(l.spot, ui.month, 9, seamless);
+        if (token !== sv.token || !sv.sketch) return;
+        const c = strip.querySelector(`[data-i="${sv.layout.indexOf(l)}"] canvas`);
+        c.width = canvas.width; c.height = canvas.height;
+        c.getContext("2d").drawImage(canvas, 0, 0);
+      } catch (error) { console.error(error); }
+    }
+    if (token === sv.token) $("#sv-loading").classList.add("hidden");
+  }
+}
+
+function svClamp(pan) {
+  const W = $("#sv-stage").clientWidth;
+  if (sv.total <= W) return (sv.total - W) / 2;
+  return Math.min(sv.total - W * 0.6, Math.max(-W * 0.4, pan));
+}
+
+// The section under the middle of the screen is "where you are".
+function svCurrent() {
+  const mid = sv.pan + $("#sv-stage").clientWidth / 2;
+  let best = sv.layout[0];
+  for (const l of sv.layout) if (Math.abs(l.x + l.w / 2 - mid) < Math.abs(best.x + best.w / 2 - mid)) best = l;
+  return best?.spot;
+}
+
+function svTargets(spot) {
+  const pose = poseOf(spot);
+  const out = { forward: [], left: null, right: null, around: null };
+  if (!pose) {
+    // Views without a plan position: use their path markers.
+    out.forward = (spot.links || []).filter((l) => l.to).map((l) => ({ id: l.to, x: l.x, label: l.label }));
+    return out;
+  }
+  const inChain = new Set(sv.chain.map((s) => s.id));
+  const h0 = Math.atan2(pose.dir[1], pose.dir[0]);
+  const byArea = new Map();
+  for (const s of state.spots) {
+    if (inChain.has(s.id)) continue;
+    const p = poseOf(s);
+    if (!p) continue;
+    const dist = Math.hypot(p.x - pose.x, p.y - pose.y);
+    let dh = Math.atan2(p.dir[1], p.dir[0]) - h0;
+    dh = Math.atan2(Math.sin(dh), Math.cos(dh));
+    if (dist < 3 && Math.abs(dh) > 0.6) {
+      const slot = Math.abs(dh) > 2.4 ? "around" : dh > 0 ? "left" : "right";
+      if (!out[slot] || dist < out[slot].dist) out[slot] = { id: s.id, dist, label: p.areaName };
+      continue;
+    }
+    const t = [p.target[0] - pose.x, p.target[1] - pose.y];
+    const fwd = t[0] * pose.dir[0] + t[1] * pose.dir[1];
+    const right = t[0] * pose.dir[1] - t[1] * pose.dir[0];
+    const ang = Math.atan2(right, fwd);
+    if (fwd > 0.5 && Math.abs(ang) < 1.05) {
+      const prev = byArea.get(p.areaName);
+      if (!prev || dist < prev.dist) byArea.set(p.areaName, { id: s.id, dist, ang, label: p.areaName });
+    } else if (!out.around || dist < out.around.dist) {
+      if (fwd < 0 && dist < 6) out.around = { id: s.id, dist, label: p.areaName };
+    }
+  }
+  out.forward = [...byArea.values()].sort((a, b) => a.dist - b.dist).slice(0, 4)
+    .map((f) => ({ ...f, x: Math.min(0.86, Math.max(0.14, 0.5 + Math.tan(Math.max(-1, Math.min(1, f.ang))) / (2 * Math.tan(SV_HALF_FOV)))) }));
+  // Spread arrows that would sit on top of each other.
+  out.forward.sort((a, b) => a.x - b.x).forEach((f, i, arr) => { if (i && f.x - arr[i - 1].x < 0.16) f.x = Math.min(0.88, arr[i - 1].x + 0.16); });
+  return out;
+}
+
+function svChrome() {
+  const spot = svCurrent() || state.spots.find((s) => s.id === sv.spotId);
+  if (!spot) return;
+  if (spot.id !== sv.spotId) sv.spotId = spot.id;
+  const idx = sv.chain.indexOf(spot);
+  $("#sv-name").textContent = sv.chain.length > 1 ? (poseOf(spot)?.areaName || spot.name) : spot.name;
+  const ph = bestPhoto(spot, ui.month);
+  $("#sv-sub").textContent = `${sv.chain.length > 1 ? `Section ${idx + 1} of ${sv.chain.length} · swipe along · ` : ""}${ph.date ? `photo ${fmtDate(ph.date)}` : ""}`;
+  $("#sv-back").hidden = !sv.history.length;
+  $("#sv-month").textContent = MONTHS[ui.month];
+  $("#sv-mode").textContent = sv.sketch ? "Show photo" : "Show sketch";
+  const t = svTargets(spot);
+  const chev = (dirSvg) => `<svg viewBox="0 0 24 24">${dirSvg}</svg>`;
+  $("#sv-nav").innerHTML = [
+    ...t.forward.map((f) => `<button class="sv-chev" data-go="${f.id}" data-x="${f.x}" style="left:${f.x * 100}%;top:74%" aria-label="Walk to ${esc(f.label)}"><span class="arrow">${chev('<path d="m6 15 6-6 6 6"/>')}</span><span>${esc(f.label)}</span></button>`),
+    t.left ? `<button class="sv-turn left" data-turn="left" data-go="${t.left.id}" aria-label="Turn left to ${esc(t.left.label)}">${chev('<path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 6 6v5"/>')}${esc(t.left.label)}</button>` : "",
+    t.right ? `<button class="sv-turn right" data-turn="right" data-go="${t.right.id}" aria-label="Turn right to ${esc(t.right.label)}">${chev('<path d="m15 14 5-5-5-5"/><path d="M20 9H10a6 6 0 0 0-6 6v5"/>')}${esc(t.right.label)}</button>` : "",
+    t.around ? `<button class="sv-chev" data-turn="around" data-go="${t.around.id}" style="left:50%;top:88%" aria-label="Turn around"><span class="arrow">${chev('<path d="M4 12a8 8 0 1 0 3-6.2"/><path d="M4 4v4h4"/>')}</span><span>Turn round</span></button>` : ""
+  ].join("");
+  svMap(spot);
+}
+
+function svMap(spot) {
+  const el = $("#sv-map");
+  if (!state.plan) { el.hidden = true; return; }
+  el.hidden = false;
+  const b = bounds(state.plan.outline);
+  const pad = 0.6, vb = `${b.x0 - pad} ${-b.y1 - pad} ${b.w + pad * 2} ${b.h + pad * 2}`;
+  const pts = (poly) => poly.map(([x, y]) => `${x},${-y}`).join(" ");
+  const r = Math.max(b.w, b.h) * 0.035;
+  const cams = state.spots.map((s) => ({ s, p: poseOf(s) })).filter((c) => c.p);
+  const me = poseOf(spot);
+  const cone = (p) => {
+    const a = Math.atan2(p.dir[1], p.dir[0]), L = Math.max(b.w, b.h) * 0.28;
+    const p1 = [p.x + Math.cos(a - SV_HALF_FOV) * L, p.y + Math.sin(a - SV_HALF_FOV) * L], p2 = [p.x + Math.cos(a + SV_HALF_FOV) * L, p.y + Math.sin(a + SV_HALF_FOV) * L];
+    return `<polygon points="${p.x},${-p.y} ${p1[0]},${-p1[1]} ${p2[0]},${-p2[1]}" fill="rgba(196,111,76,.35)" stroke="#c46f4c" stroke-width="${r * 0.25}"/>`;
+  };
+  el.innerHTML = `<svg viewBox="${vb}" preserveAspectRatio="xMidYMid meet">
+    <polygon points="${pts(state.plan.outline)}" fill="#e6ead6" stroke="#8a9a76" stroke-width="${r * 0.3}"/>
+    ${state.plan.areas.map((a) => `<polygon points="${pts(a.poly)}" fill="rgba(93,118,80,.22)" stroke="none"/>`).join("")}
+    <rect x="${b.x0}" y="${-b.y0}" width="${b.w}" height="${r * 1.6}" fill="#e2dac8"/>
+    ${me ? cone(me) : ""}
+    ${cams.map(({ s, p }) => `<circle data-sv-spot="${s.id}" cx="${p.x}" cy="${-p.y}" r="${s.id === spot.id ? r * 1.25 : r * 0.85}" fill="${s.id === spot.id ? "#2f3f2c" : sv.chain.includes(s) ? "#5d7650" : "#fbf8f1"}" stroke="#2f3f2c" stroke-width="${r * 0.3}"/>`).join("")}
+  </svg>`;
+}
+
+function setupStreet() {
+  const stage = $("#sv-stage"), strip = $("#sv-strip");
+  let drag = null;
+  stage.addEventListener("pointerdown", (e) => {
+    if (e.target.closest("button")) return;
+    stage.setPointerCapture(e.pointerId);
+    drag = { x: e.clientX, pan: sv.pan, moved: false };
+  });
+  stage.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x;
+    if (Math.abs(dx) > 6) drag.moved = true;
+    sv.pan = svClamp(drag.pan - dx);
+    strip.style.transform = `translateX(${-sv.pan}px)`;
+  });
+  const end = () => {
+    if (!drag) return;
+    const moved = drag.moved;
+    drag = null;
+    if (moved) svChrome();
+  };
+  stage.addEventListener("pointerup", end);
+  stage.addEventListener("pointercancel", end);
+  $("#sv-nav").addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-go]");
+    if (!btn) return;
+    const turn = btn.dataset.turn;
+    svGo(btn.dataset.go, { animate: turn === "left" ? "left" : turn === "right" ? "right" : turn === "around" ? "fade" : "forward", origin: { x: Number(btn.dataset.x || 0.5) } });
+  });
+  $("#sv-map").addEventListener("click", (e) => {
+    const dot = e.target.closest("[data-sv-spot]");
+    if (dot && dot.dataset.svSpot !== sv.spotId) svGo(dot.dataset.svSpot, { animate: "fade" });
+  });
+  $("#sv-close").addEventListener("click", svClose);
+  $("#sv-back").addEventListener("click", () => { const prev = sv.history.pop(); if (prev) svGo(prev, { animate: "fade", keepHistory: true }); });
+  $("#sv-mode").addEventListener("click", () => { sv.sketch = !sv.sketch; svBuild(state.spots.find((s) => s.id === sv.spotId)); });
+  const month = (d) => { ui.month = (ui.month + d + 12) % 12; svBuild(state.spots.find((s) => s.id === sv.spotId)); };
+  $("#sv-prev-month").addEventListener("click", () => month(-1));
+  $("#sv-next-month").addEventListener("click", () => month(1));
+  document.addEventListener("keydown", (e) => {
+    if ($("#street").hidden) return;
+    if (e.key === "Escape") svClose();
+    if (e.key === "ArrowLeft" || e.key === "ArrowRight") { sv.pan = svClamp(sv.pan + (e.key === "ArrowLeft" ? -1 : 1) * innerWidth * 0.4); strip.classList.add("anim"); strip.style.transform = `translateX(${-sv.pan}px)`; setTimeout(() => { strip.classList.remove("anim"); svChrome(); }, 460); }
+    if (e.key === "ArrowUp") $("#sv-nav [data-go]:not([data-turn])")?.click();
+  });
+  addEventListener("resize", () => { if (!$("#street").hidden) svBuild(state.spots.find((s) => s.id === sv.spotId)); });
+}
+
 /* ---------- settings ---------- */
 function openSettings() {
   const s = state.settings;
@@ -2456,6 +2747,8 @@ async function playYear() {
 }
 
 function bindEvents() {
+  setupStreet();
+  $("#sv-open").addEventListener("click", () => svOpen());
   document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => switchView(tab.dataset.view)));
   $("#settings-btn").addEventListener("click", openSettings);
   $("#sheet-close").addEventListener("click", closeSheet);

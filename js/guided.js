@@ -674,7 +674,7 @@ export function settleAreas(plan, first = []) {
 }
 
 /* ---------- where things in a photo sit on the plan ---------- */
-function shotOfSpot(plan, spot) {
+export function shotOfSpot(plan, spot) {
   if (!plan || !spot?.planAreaId) return null;
   const area = plan.areas.find((a) => a.id === spot.planAreaId);
   if (!area) return null;
