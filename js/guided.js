@@ -188,7 +188,26 @@ export function suggestedOrder(plan) {
     }
     takeRun(next, here);
   }
-  return [...out, ...rest.flatMap((u) => u.shots)];
+  // Where the walk turns a sharp corner from one border straight onto another, add a photo
+  // looking diagonally into the corner: it overlaps both, which side-by-side photos can't.
+  const walk = [];
+  out.forEach((sh, i) => {
+    walk.push(sh);
+    const nx = out[i + 1];
+    if (nx && isSectioned(sh.area) && isSectioned(nx.area) && sh.area !== nx.area && gap(sh.poly, nx.poly) < 0.6) {
+      const a = cameraFor(plan, sh).dir, b = cameraFor(plan, nx).dir;
+      if (a[0] * b[0] + a[1] * b[1] < 0.5) walk.push(cornerShot(sh, nx));
+    }
+  });
+  return [...walk, ...rest.flatMap((u) => u.shots)];
+}
+
+function cornerShot(from, to) {
+  const key = `corner:${from.key}|${to.key}`;
+  const b = bounds([...from.poly, ...to.poly]);
+  const poly = [[b.x0, b.y0], [b.x1, b.y0], [b.x1, b.y1], [b.x0, b.y1]];
+  const name = `Corner: ${from.area.name} to ${to.area.name}`;
+  return { key, area: { id: key, name: "Corner", poly }, index: null, count: 1, poly, length: Math.max(b.w, b.h), name, corner: true, from, to };
 }
 function gap(p, q) {
   const a = bounds(p), b = bounds(q);
@@ -197,7 +216,7 @@ function gap(p, q) {
 // Are these two photos of neighbouring stretches, taken facing much the same way? Then the
 // second can be lined up with the edge of the first.
 export function continues(plan, prev, next) {
-  if (gap(prev.poly, next.poly) > 0.6) return false;
+  if (prev.corner || next.corner || gap(prev.poly, next.poly) > 0.6) return false;
   const a = cameraFor(plan, prev).dir, b = cameraFor(plan, next).dir;
   return a[0] * b[0] + a[1] * b[1] > 0.5; // within 60°
 }
@@ -215,6 +234,22 @@ export function cameraFor(plan, area) {
     return { x: own.x, y: own.y, dir: [own.dir[0] / l, own.dir[1] / l], dist: Math.hypot(c[0] - own.x, c[1] - own.y), along: false, custom: true };
   }
   const g = centroid(plan.outline);
+  if (area.corner) {
+    // Halfway between the two borders' views, looking into the corner from far enough back to
+    // take in the end of one and the start of the other.
+    const a = cameraFor(plan, area.from).dir, b = cameraFor(plan, area.to).dir;
+    let d = [a[0] + b[0], a[1] + b[1]];
+    const dl = Math.hypot(d[0], d[1]);
+    d = dl > 0.2 ? [d[0] / dl, d[1] / dl] : a;
+    const ca = centroid(area.from.poly), cb = centroid(area.to.poly);
+    const t = [(ca[0] + cb[0]) / 2, (ca[1] + cb[1]) / 2];
+    const blocked = (x, y) => !inside(x, y, plan.outline) || plan.areas.some((o) => isSectioned(o) && inside(x, y, o.poly));
+    for (let dist = 4; dist >= 1; dist -= 0.25) {
+      const x = t[0] - d[0] * dist, y = t[1] - d[1] * dist;
+      if (!blocked(x, y)) return { x, y, dir: d, dist, along: false };
+    }
+    return { x: t[0] - d[0] * 1.5, y: t[1] - d[1] * 1.5, dir: d, dist: 1.5, along: false };
+  }
   const ownId = area.area?.id || area.id;
   // You can stand on a lawn or patio, but not in another border.
   const others = plan.areas.filter((a) => a.id !== ownId && isSectioned(a));
@@ -748,6 +783,7 @@ export function settleAreas(plan, first = []) {
 /* ---------- where things in a photo sit on the plan ---------- */
 export function shotOfSpot(plan, spot) {
   if (!plan || !spot?.planAreaId) return null;
+  if (spot.planAreaId.startsWith("corner:")) return shotsFor(plan).find((s) => s.key === spot.planAreaId) || null;
   const area = plan.areas.find((a) => a.id === spot.planAreaId);
   if (!area) return null;
   const shots = shotsOf(area);

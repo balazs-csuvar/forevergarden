@@ -1941,6 +1941,7 @@ function runGuidedWalk({ garden = null } = {}) {
         }
       }
       if (existing?.photoId) return { ghostUrl: await photoUrl(existing.photoId), ghostMode: "full", hint: "Line the picture up with last time's photo, then take it." };
+      if (sh.corner) return { hint: "Face into the corner: the end of one border and the start of the next, both in the photo." };
       return { hint: "Fit the whole stretch in, phone upright at chest height." };
     };
     // The walk saves as you go: plan, step and photos, so you can stop and carry on later.
@@ -2146,15 +2147,17 @@ function runGuidedWalk({ garden = null } = {}) {
       const existing = shotSpot(garden, sh);
       const taken = work.photos[sh.key];
       const what = sh.count > 1 ? `this ${fmtM(sh.length)} section` : `the ${esc(sh.area.name.toLowerCase())}`;
-      const hint = cam.custom
+      const hint = sh.corner
+        ? `Stand on the dot, about ${fmtM(cam.dist)} back, and face into the corner so the end of the ${esc(sh.from.area.name.toLowerCase())} and the start of the ${esc(sh.to.area.name.toLowerCase())} are both in the photo.`
+        : cam.custom
         ? `Stand where you've put the dot, about ${fmtM(cam.dist)} from ${what}, facing the way the arrow points.`
         : cam.along
           ? `Stand at the house end, just beside ${what}, and look along it so it runs away from you. Fit in as much as you can.`
           : `Stand about ${fmtM(cam.dist)} back, facing ${what}, and fit it in from end to end.${sh.count > 1 ? ` Sections are counted from the ${bounds(sh.area.poly).h >= bounds(sh.area.poly).w ? "house end" : "left"}.` : ""}`;
-      const planOpts = { highlight: sh.area.id, shot: sh.count > 1 ? sh : null };
+      const planOpts = { highlight: sh.corner ? null : sh.area.id, shot: sh.count > 1 || sh.corner ? sh : null };
       panel.innerHTML = `${top("Back")}
         <p class="eyebrow">Photo ${photoIndex + 1} of ${shots.length}${existing ? " · retake for this season" : ""}</p>
-        <h1>${esc(sh.area.name)}${sh.count > 1 ? ` <em>${sh.index + 1} of ${sh.count}</em>` : ""}</h1>
+        <h1>${sh.corner ? `Corner <em>${esc(sh.from.area.name)} to ${esc(sh.to.area.name)}</em>` : `${esc(sh.area.name)}${sh.count > 1 ? ` <em>${sh.index + 1} of ${sh.count}</em>` : ""}`}</h1>
         ${planSvg(work.plan, { ...planOpts, camera: cam, editCamera: true, widthPx: Math.min(440, window.innerWidth - 48), heightPx: window.innerHeight * 0.34 }, 'class="plan-svg guide-plan cam-edit" role="img" aria-label="Plan showing what to photograph and where to stand"')}
         <p class="muted" style="margin:0;font-size:12.5px">Drag the dot to stand somewhere else, or the round handle to turn.${cam.custom ? ` <button class="linkish" id="g-cam-reset">Back to the suggested spot</button>` : ""}</p>
         <p class="lede">${hint}</p>
@@ -2168,7 +2171,7 @@ function runGuidedWalk({ garden = null } = {}) {
       panel.querySelector("#g-photo").addEventListener("click", async () => {
         const guide = await walkGuide(sh, shots, existing);
         let ghostUsed = false;
-        const blob = await pickPhoto({ ...guide, title: `${sh.area.name}${sh.count > 1 ? ` ${sh.index + 1} of ${sh.count}` : ""}`, onGhost: (used) => { ghostUsed = used; } });
+        const blob = await pickPhoto({ ...guide, title: sh.corner ? sh.name : `${sh.area.name}${sh.count > 1 ? ` ${sh.index + 1} of ${sh.count}` : ""}`, onGhost: (used) => { ghostUsed = used; } });
         if (guide.revoke) URL.revokeObjectURL(guide.ghostUrl);
         if (!blob) return;
         if (guide.prevKey && ghostUsed) work.ghosts[sh.key] = { prevKey: guide.prevKey, side: guide.ghostMode, overlap: guide.overlap };
@@ -2546,44 +2549,49 @@ function svCurrent() {
   return best?.spot;
 }
 
+// The views in the order the photos were taken (the walk round the garden), then any others.
+function walkOrderSpots() {
+  const out = [];
+  if (state.plan) for (const sh of shotsFor(state.plan)) {
+    const s = state.spots.find((sp) => sp.planAreaId === sh.area.id && (sp.planSection ?? null) === sh.index);
+    if (s && !out.includes(s)) out.push(s);
+  }
+  for (const s of state.spots) if (!out.includes(s)) out.push(s);
+  return out;
+}
+
+// Just two ways on: the next view in the walk and the previous one, each shown as an arrow
+// pointing the way it really lies (ahead, left, right or behind).
 function svTargets(spot) {
-  const pose = poseOf(spot);
   const out = { forward: [], left: null, right: null, around: null };
-  if (!pose) {
-    // Views without a plan position: use their path markers.
-    out.forward = (spot.links || []).filter((l) => l.to).map((l) => ({ id: l.to, x: l.x, label: l.label }));
-    return out;
-  }
-  const inChain = new Set(sv.chain.map((s) => s.id));
-  const h0 = Math.atan2(pose.dir[1], pose.dir[0]);
-  const byArea = new Map();
-  for (const s of state.spots) {
-    if (inChain.has(s.id)) continue;
-    const p = poseOf(s);
-    if (!p) continue;
-    const dist = Math.hypot(p.x - pose.x, p.y - pose.y);
-    let dh = Math.atan2(p.dir[1], p.dir[0]) - h0;
-    dh = Math.atan2(Math.sin(dh), Math.cos(dh));
-    if (dist < 3 && Math.abs(dh) > 0.6) {
-      const slot = Math.abs(dh) > 2.4 ? "around" : dh > 0 ? "left" : "right";
-      if (!out[slot] || dist < out[slot].dist) out[slot] = { id: s.id, dist, label: p.areaName };
-      continue;
+  const order = walkOrderSpots();
+  const group = sv.chain.length > 1 && sv.chain.includes(spot) ? sv.chain : [spot];
+  const idxs = group.map((s) => order.indexOf(s)).filter((i) => i >= 0);
+  if (!idxs.length) return out;
+  const hi = Math.max(...idxs), lo = Math.min(...idxs);
+  const next = order.slice(hi + 1).find((s) => !group.includes(s));
+  const prev = order.slice(0, lo).reverse().find((s) => !group.includes(s));
+  const place = (target, role) => {
+    const from = role === "next" ? order[hi] : order[lo];
+    const pose = poseOf(from), p = poseOf(target);
+    let ang = role === "next" ? 0 : Math.PI;
+    if (pose && p) {
+      const t = [p.target[0] - pose.x, p.target[1] - pose.y];
+      ang = Math.atan2(t[0] * pose.dir[1] - t[1] * pose.dir[0], t[0] * pose.dir[0] + t[1] * pose.dir[1]);
     }
-    const t = [p.target[0] - pose.x, p.target[1] - pose.y];
-    const fwd = t[0] * pose.dir[0] + t[1] * pose.dir[1];
-    const right = t[0] * pose.dir[1] - t[1] * pose.dir[0];
-    const ang = Math.atan2(right, fwd);
-    if (fwd > 0.5 && Math.abs(ang) < 1.05) {
-      const prev = byArea.get(p.areaName);
-      if (!prev || dist < prev.dist) byArea.set(p.areaName, { id: s.id, dist, ang, label: p.areaName });
-    } else if (!out.around || dist < out.around.dist) {
-      if (fwd < 0 && dist < 6) out.around = { id: s.id, dist, label: p.areaName };
+    const item = { id: target.id, label: role === "next" ? "Next" : "Previous", name: target.name, dist: 0 };
+    if (Math.abs(ang) < 0.6 && !out.forward.length) {
+      out.forward.push({ ...item, x: Math.min(0.8, Math.max(0.2, 0.5 + Math.tan(ang) / (2 * Math.tan(SV_HALF_FOV)))) });
+    } else if (Math.abs(ang) > 2.4 && !out.around) out.around = item;
+    else {
+      const slot = ang > 0 ? "right" : "left";
+      if (!out[slot]) out[slot] = item;
+      else if (!out[slot === "right" ? "left" : "right"]) out[slot === "right" ? "left" : "right"] = item;
+      else out.around ||= item;
     }
-  }
-  out.forward = [...byArea.values()].sort((a, b) => a.dist - b.dist).slice(0, 4)
-    .map((f) => ({ ...f, x: Math.min(0.86, Math.max(0.14, 0.5 + Math.tan(Math.max(-1, Math.min(1, f.ang))) / (2 * Math.tan(SV_HALF_FOV)))) }));
-  // Spread arrows that would sit on top of each other.
-  out.forward.sort((a, b) => a.x - b.x).forEach((f, i, arr) => { if (i && f.x - arr[i - 1].x < 0.16) f.x = Math.min(0.88, arr[i - 1].x + 0.16); });
+  };
+  if (next) place(next, "next");
+  if (prev) place(prev, "previous");
   return out;
 }
 
@@ -2601,10 +2609,10 @@ function svChrome() {
   const t = svTargets(spot);
   const chev = (dirSvg) => `<svg viewBox="0 0 24 24">${dirSvg}</svg>`;
   $("#sv-nav").innerHTML = [
-    ...t.forward.map((f) => `<button class="sv-chev" data-go="${f.id}" data-x="${f.x}" style="left:${f.x * 100}%;top:74%" aria-label="Walk to ${esc(f.label)}"><span class="arrow">${chev('<path d="m6 15 6-6 6 6"/>')}</span><span>${esc(f.label)}</span></button>`),
-    t.left ? `<button class="sv-turn left" data-turn="left" data-go="${t.left.id}" aria-label="Turn left to ${esc(t.left.label)}">${chev('<path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 6 6v5"/>')}${esc(t.left.label)}</button>` : "",
-    t.right ? `<button class="sv-turn right" data-turn="right" data-go="${t.right.id}" aria-label="Turn right to ${esc(t.right.label)}">${chev('<path d="m15 14 5-5-5-5"/><path d="M20 9H10a6 6 0 0 0-6 6v5"/>')}${esc(t.right.label)}</button>` : "",
-    t.around ? `<button class="sv-chev" data-turn="around" data-go="${t.around.id}" style="left:50%;top:88%" aria-label="Turn around"><span class="arrow">${chev('<path d="M4 12a8 8 0 1 0 3-6.2"/><path d="M4 4v4h4"/>')}</span><span>Turn round</span></button>` : ""
+    ...t.forward.map((f) => `<button class="sv-chev" data-go="${f.id}" data-x="${f.x}" style="left:${f.x * 100}%;top:74%" aria-label="${esc(f.label)}: ${esc(f.name || "")}"><span class="arrow">${chev('<path d="m6 15 6-6 6 6"/>')}</span><span>${esc(f.label)}</span></button>`),
+    t.left ? `<button class="sv-turn left" data-turn="left" data-go="${t.left.id}" aria-label="${esc(t.left.label)}: ${esc(t.left.name || "")}">${chev('<path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 6 6v5"/>')}${esc(t.left.label)}</button>` : "",
+    t.right ? `<button class="sv-turn right" data-turn="right" data-go="${t.right.id}" aria-label="${esc(t.right.label)}: ${esc(t.right.name || "")}">${chev('<path d="m15 14 5-5-5-5"/><path d="M20 9H10a6 6 0 0 0-6 6v5"/>')}${esc(t.right.label)}</button>` : "",
+    t.around ? `<button class="sv-chev" data-turn="around" data-go="${t.around.id}" style="left:50%;top:88%" aria-label="${esc(t.around.label)}: ${esc(t.around.name || "")}"><span class="arrow">${chev('<path d="M4 12a8 8 0 1 0 3-6.2"/><path d="M4 4v4h4"/>')}</span><span>${esc(t.around.label)}</span></button>` : ""
   ].join("");
   svMap(spot);
 }
