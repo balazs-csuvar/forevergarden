@@ -133,7 +133,74 @@ export function shotsOf(area) {
     name: `${area.name} · ${i + 1} of ${n}`
   })).filter((s) => s.poly.length >= 3);
 }
-export const shotsFor = (plan) => plan.areas.flatMap(shotsOf);
+// All the photos to take, in walking order: borders section by section, with any other area that
+// touches a border slotted in beside the section it's next to (a bed where the border turns,
+// say). Your own order (plan.order) wins; anything new fits in after the photo before it.
+export function shotsFor(plan) {
+  const suggested = suggestedOrder(plan);
+  if (!plan.order?.length) return suggested;
+  const byKey = new Map(suggested.map((sh) => [sh.key, sh]));
+  const out = plan.order.filter((k) => byKey.has(k)).map((k) => byKey.get(k));
+  const placed = new Set(out.map((sh) => sh.key));
+  suggested.forEach((sh, i) => {
+    if (placed.has(sh.key)) return;
+    let at = 0;
+    for (let j = i - 1; j >= 0; j--) { const k = out.indexOf(suggested[j]); if (k >= 0) { at = k + 1; break; } }
+    out.splice(at, 0, sh);
+    placed.add(sh.key);
+  });
+  return out;
+}
+export function suggestedOrder(plan) {
+  // A walk round the garden: start at the border nearest the house on the left, follow it
+  // section by section, step through whatever small area joins it to the next border (a bed at
+  // a corner or a turn), carry on along that one, and so on. Areas that don't link borders
+  // (a lawn, a patio in the middle) come last.
+  const units = plan.areas.map((a) => ({ a, shots: shotsOf(a), border: isSectioned(a) }));
+  const borders = units.filter((u) => u.border);
+  const touchesBorder = (u) => borders.some((b) => b !== u && u.shots.some((sh) => b.shots.some((t) => gap(sh.poly, t.poly) < 0.6)));
+  const links = units.filter((u) => !u.border && Math.abs(signedArea(u.a.poly)) <= 10 && touchesBorder(u));
+  const rest = units.filter((u) => !borders.includes(u) && !links.includes(u));
+  const out = [];
+  const todo = new Set([...borders, ...links]);
+  const ends = (u) => [u.shots[0], u.shots[u.shots.length - 1]];
+  const takeRun = (u, from) => {
+    // Enter at the end nearest where we are, and walk to the other end.
+    const [first, lastShot] = ends(u);
+    const fromFirst = !from || gap(from.poly, first.poly) <= gap(from.poly, lastShot.poly) ? true : false;
+    out.push(...(fromFirst ? u.shots : [...u.shots].reverse()));
+    todo.delete(u);
+  };
+  while (todo.size) {
+    const here = out[out.length - 1];
+    let next = null, nd = Infinity;
+    for (const u of todo) for (const e of ends(u)) {
+      const d = here ? gap(here.poly, e.poly) + (u.border ? 0 : -0.01) : (() => { const c = centroid(e.poly); return c[1] * 10 + c[0]; })();
+      if (d < nd) { nd = d; next = u; }
+    }
+    if (here && nd > 0.6) {
+      // Nothing joins on: jump to the nearest border end that's left.
+      next = null; nd = Infinity;
+      for (const u of todo) for (const e of ends(u)) {
+        const c = centroid(e.poly), h = centroid(here.poly), d = Math.hypot(c[0] - h[0], c[1] - h[1]);
+        if (d < nd) { nd = d; next = u; }
+      }
+    }
+    takeRun(next, here);
+  }
+  return [...out, ...rest.flatMap((u) => u.shots)];
+}
+function gap(p, q) {
+  const a = bounds(p), b = bounds(q);
+  return Math.hypot(Math.max(0, Math.max(a.x0, b.x0) - Math.min(a.x1, b.x1)), Math.max(0, Math.max(a.y0, b.y0) - Math.min(a.y1, b.y1)));
+}
+// Are these two photos of neighbouring stretches, taken facing much the same way? Then the
+// second can be lined up with the edge of the first.
+export function continues(plan, prev, next) {
+  if (gap(prev.poly, next.poly) > 0.6) return false;
+  const a = cameraFor(plan, prev).dir, b = cameraFor(plan, next).dir;
+  return a[0] * b[0] + a[1] * b[1] > 0.5; // within 60°
+}
 export const sectionCount = (area) => shotsOf(area).length;
 
 // Where to stand to photograph an area. Usually back from it towards the middle of the garden,
@@ -208,7 +275,7 @@ export function viewBoxFor(plan, pad = 0.18) {
 }
 
 // k = metres per screen pixel, so handles and text stay a constant size on screen.
-export function planSvgInner(plan, { k = 0.05, mode = "view", selected = null, highlight = null, camera = null, shot = null, dots = null, editCamera = false } = {}) {
+export function planSvgInner(plan, { k = 0.05, mode = "view", selected = null, highlight = null, camera = null, shot = null, dots = null, editCamera = false, numbers = null } = {}) {
   const ob = bounds(plan.outline);
   const font = 12 * k;
   const out = [];
@@ -227,13 +294,18 @@ export function planSvgInner(plan, { k = 0.05, mode = "view", selected = null, h
         out.push(`<polygon points="${pts2(sh.poly)}" fill="${mode === "view" && !highlight ? "transparent" : "none"}" stroke="#fbf8f1" stroke-opacity="${dim ? 0.5 : 0.9}" stroke-width="${1.6 * k}" stroke-dasharray="${4 * k} ${3 * k}" ${mode === "view" && !highlight ? `data-shot="${sh.key}"` : 'pointer-events="none"'}/>`);
       });
     }
-    if ((isSel && mode === "areas") || dim || (shot && shots.length > 1)) return;
+    if ((isSel && mode === "areas") || dim || (shot && shots.length > 1) || numbers) return;
     const [cx, cy] = S(centroid(a.poly));
     // Names run along tall, narrow areas so they fit.
     const ab = bounds(a.poly);
     const rot = ab.h > ab.w * 1.8 && ab.w < 2.5 ? ` transform="rotate(-90 ${cx} ${cy})"` : "";
     out.push(`<text${rot} x="${cx}" y="${cy + font * 0.35}" font-size="${font}" font-weight="700" text-anchor="middle" fill="#2a2b23" opacity="${dim ? 0.45 : 1}" pointer-events="none" style="paint-order:stroke" stroke="#fbf8f1" stroke-width="${3 * k}">${escXml(a.name)}</text>`);
   });
+  // Photo order: a numbered badge on each photo's stretch.
+  if (numbers) for (const n of numbers) {
+    const [x, y] = S(n.at);
+    out.push(`<g data-num="${escXml(n.key)}"><circle cx="${x}" cy="${y}" r="${9 * k}" fill="${n.on ? "#c46f4c" : "#2a2b23"}" stroke="#fbf8f1" stroke-width="${1.6 * k}"/><text x="${x}" y="${y + 3.6 * k}" font-size="${10 * k}" font-weight="700" text-anchor="middle" fill="#fff">${n.n}</text></g>`);
+  }
   // One dot per plant, coloured by its flower or foliage.
   if (dots) for (const d of dots) {
     const [x, y] = S([d.x, d.y]);

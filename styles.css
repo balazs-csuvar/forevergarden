@@ -384,3 +384,14 @@ body.camera-open { overflow: hidden; }
 .cam-review { position: absolute; inset: 0; background: #000; }
 .cam-review img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
 .cam-msg { position: absolute; left: 20px; right: 20px; top: 40%; text-align: center; font-size: 15px; line-height: 1.5; background: rgba(0,0,0,.6); padding: 16px; border-radius: 14px; }
+.cam-frame { transition: box-shadow 0.25s; }
+.cam.close .cam-frame { box-shadow: inset 0 0 0 3px rgba(214, 230, 140, 0.55), inset 0 0 28px rgba(214, 230, 140, 0.35); }
+.cam.aligned .cam-frame { box-shadow: inset 0 0 0 5px rgba(140, 220, 120, 0.95), inset 0 0 46px rgba(140, 220, 120, 0.7); }
+.cam.aligned .cam-seam { border-left-color: rgba(140, 220, 120, 1); }
+.order-list { display: flex; flex-direction: column; gap: 4px; }
+.order-row { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 10px; background: var(--card); border: 1px solid var(--line); font-size: 14px; }
+.order-row.on { border-color: var(--terra); box-shadow: inset 0 0 0 1px var(--terra); }
+.order-row .grow { flex: 1; min-width: 0; }
+.order-row small { color: var(--sage); font-size: 11.5px; white-space: nowrap; }
+.order-row .btn.small { min-height: 34px; min-width: 38px; padding: 0 8px; }
+.order-n { width: 24px; height: 24px; border-radius: 50%; background: var(--ink); color: #fff; font-size: 12px; font-weight: 700; display: grid; place-items: center; flex: none; }

@@ -10,7 +10,7 @@ import { MONTHS, MON, monthRange, nearestArea, bloomCoverage, speciesFor, recomm
 import * as ai from "./ai.js";
 import { overlapOffset } from "./align.js";
 import { loadWeather, syncWeather, findPlace, monthSummary, lastDays, isoDay } from "./weather.js";
-import { newPlan, bounds, signedArea, centroid, describeSize, setSideLength, presetArea, cameraFor, linkSpot, fmtM, planSvg, mountPlanEditor, settleAreas, shotsFor, shotsOf, isSectioned, planPoint, neighbourSpotIds, mountCameraEditor, shotOfSpot } from "./guided.js";
+import { newPlan, bounds, signedArea, centroid, describeSize, setSideLength, presetArea, cameraFor, linkSpot, fmtM, planSvg, mountPlanEditor, settleAreas, shotsFor, shotsOf, isSectioned, planPoint, neighbourSpotIds, mountCameraEditor, shotOfSpot, continues } from "./guided.js";
 
 const ENGINE = "sk6";
 const WORK_SIZE = 1200;
@@ -1928,14 +1928,16 @@ function runGuidedWalk({ garden = null } = {}) {
     // border (on the side where they meet), or last time's photo of this view when retaking.
     const GHOST_OVERLAP = 0.22;
     const walkGuide = async (sh, shots, existing) => {
-      if (sh.count > 1 && sh.index > 0) {
-        const prev = shots.find((x) => x.area === sh.area && x.index === sh.index - 1);
+      // The photo before this one in the walk, if it's the stretch right next to it.
+      const prev = shots[shots.indexOf(sh) - 1];
+      if (prev && continues(work.plan, prev, sh)) {
         const prevSpot = shotSpot(garden, prev);
         const blob = work.photos[prev.key];
         const url = blob ? URL.createObjectURL(blob) : prevSpot ? await photoUrl(prevSpot.photoId) : null;
         if (url) {
           const side = linkSpot(cameraFor(work.plan, prev), centroid(sh.poly)).x >= 0.5 ? "left" : "right";
-          return { ghostUrl: url, ghostMode: side, overlap: GHOST_OVERLAP, prevKey: prev.key, revoke: !!blob, hint: `Line up the faded strip on the ${side} with section ${sh.index}: same plants, same place.` };
+          const prevName = prev.area === sh.area ? `section ${prev.index + 1}` : prev.name;
+          return { ghostUrl: url, ghostMode: side, overlap: GHOST_OVERLAP, prevKey: prev.key, revoke: !!blob, hint: `Line up the faded strip on the ${side} with ${prevName}: same plants, same place. The edge glows green when it matches.` };
         }
       }
       if (existing?.photoId) return { ghostUrl: await photoUrl(existing.photoId), ghostMode: "full", hint: "Line the picture up with last time's photo, then take it." };
@@ -1964,7 +1966,7 @@ function runGuidedWalk({ garden = null } = {}) {
       close(null);
     };
     const dots = () => {
-      const all = ["size", "shape", "areas", ...(work.plan ? shotsFor(work.plan) : []).map((_, k) => `photo${k}`)];
+      const all = ["size", "shape", "areas", "order", ...(work.plan ? shotsFor(work.plan) : []).map((_, k) => `photo${k}`)];
       const now = step === "photo" ? `photo${photoIndex}` : step;
       const at = all.indexOf(now);
       return `<div class="guide-dots">${all.map((_, k) => `<i class="${k < at ? "done" : k === at ? "now" : ""}"></i>`).join("")}</div>`;
@@ -2054,10 +2056,10 @@ function runGuidedWalk({ garden = null } = {}) {
         <div class="plan-wrap"><svg class="plan-editor" font-family="DM Sans, sans-serif" role="img" aria-label="Plan of the garden with areas"></svg><div class="plan-zoom"><button class="round-tool" data-z="in" aria-label="Zoom in"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button><button class="round-tool" data-z="out" aria-label="Zoom out"><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button><button class="round-tool" data-z="fit" aria-label="Show the whole garden"><svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button></div></div>
         <div id="g-edit" class="plan-edit"></div>
         <div class="chip-row">${presets.filter(([k, label]) => ["other", "bed"].includes(k) || !usedNames.has(label)).map(([k, label]) => `<button class="btn small" data-preset="${k}">+ ${label}</button>`).join("")}</div>
-        <button class="btn dark onboard-btn" id="g-next" ${work.plan.areas.length ? "" : "disabled"}>Next: take ${shotsFor(work.plan).length || ""} photo${shotsFor(work.plan).length === 1 ? "" : "s"}</button>`;
+        <button class="btn dark onboard-btn" id="g-next" ${work.plan.areas.length ? "" : "disabled"}>Next: photo order (${shotsFor(work.plan).length} photo${shotsFor(work.plan).length === 1 ? "" : "s"})</button>`;
       const edit = panel.querySelector("#g-edit");
       const areaSummary = (a) => { const sh = shotsOf(a); return `${describeSize(a.poly)} · ${sh.length > 1 ? `${sh.length} photos of ${fmtM(sh[0].length)}` : "1 photo"}`; };
-      const nextLabel = () => { const n = shotsFor(work.plan).length; panel.querySelector("#g-next").textContent = `Next: take ${n} photo${n === 1 ? "" : "s"}`; };
+      const nextLabel = () => { const n = shotsFor(work.plan).length; panel.querySelector("#g-next").textContent = `Next: photo order (${n} photo${n === 1 ? "" : "s"})`; };
       const showSelected = (id) => {
         const a = work.plan.areas.find((x) => x.id === id);
         if (!a) { edit.innerHTML = `<p class="muted" style="margin:0">${work.plan.areas.length ? "Tap an area on the plan to change it." : "Add the areas you'd like to photograph."}</p>`; return; }
@@ -2105,7 +2107,35 @@ function runGuidedWalk({ garden = null } = {}) {
         renderAreas(a.id);
       }));
       panel.querySelector("#g-back").addEventListener("click", () => { step = "shape"; render(); });
-      panel.querySelector("#g-next").addEventListener("click", () => { if (!work.plan.areas.length) return; settle(); photoIndex = 0; step = "photo"; render(); });
+      panel.querySelector("#g-next").addEventListener("click", () => { if (!work.plan.areas.length) return; settle(); step = "order"; render(); });
+    };
+
+    // The order photos are taken in: a suggested walk round the garden, changeable with ↑ / ↓.
+    const renderOrder = (focus = null) => {
+      const shots = shotsFor(work.plan);
+      const numbers = shots.map((sh, i) => ({ key: sh.key, n: i + 1, at: centroid(sh.poly), on: sh.key === focus }));
+      panel.innerHTML = `${top("Back")}
+        <p class="eyebrow">Your garden plan</p>
+        <h1>Photo <em>order</em></h1>
+        <p class="muted" style="margin:0">A walk round the garden. Each photo is lined up with the one before when they're next to each other, so put a bed at a turn between the border photos either side of it.</p>
+        ${planSvg(work.plan, { numbers, widthPx: Math.min(440, window.innerWidth - 48), heightPx: window.innerHeight * 0.3 }, 'class="plan-svg guide-plan" role="img" aria-label="Plan with the photo order"')}
+        <div class="order-list">${shots.map((sh, i) => `<div class="order-row${sh.key === focus ? " on" : ""}" data-key="${esc(sh.key)}"><span class="order-n">${i + 1}</span><span class="grow">${esc(sh.name)}${i > 0 && continues(work.plan, shots[i - 1], sh) ? ` <small>lines up with ${i}</small>` : ""}</span><button class="btn small ghost" data-mv="-1" aria-label="Earlier" ${i === 0 ? "disabled" : ""}>↑</button><button class="btn small ghost" data-mv="1" aria-label="Later" ${i === shots.length - 1 ? "disabled" : ""}>↓</button></div>`).join("")}</div>
+        <button class="linkish" id="g-order-reset" style="align-self:flex-start">Back to the suggested order</button>
+        <button class="btn dark onboard-btn" id="g-next">Next: take ${shots.length} photo${shots.length === 1 ? "" : "s"}</button>`;
+      panel.querySelectorAll("[data-mv]").forEach((btn) => btn.addEventListener("click", () => {
+        const key = btn.closest("[data-key]").dataset.key;
+        const keys = shotsFor(work.plan).map((x) => x.key);
+        const i = keys.indexOf(key), j = i + Number(btn.dataset.mv);
+        if (j < 0 || j >= keys.length) return;
+        [keys[i], keys[j]] = [keys[j], keys[i]];
+        work.plan.order = keys;
+        saveDraft();
+        renderOrder(key);
+        panel.querySelector(`[data-key="${CSS.escape(key)}"]`)?.scrollIntoView({ block: "nearest" });
+      }));
+      panel.querySelector("#g-order-reset").addEventListener("click", () => { delete work.plan.order; saveDraft(); renderOrder(); });
+      panel.querySelector("#g-back").addEventListener("click", () => { step = "areas"; render(); });
+      panel.querySelector("#g-next").addEventListener("click", () => { photoIndex = 0; step = "photo"; render(); });
     };
 
     const renderPhoto = () => {
@@ -2133,7 +2163,7 @@ function runGuidedWalk({ garden = null } = {}) {
         <button class="btn ghost" id="g-skip">${photoIndex === shots.length - 1 ? (taken || Object.keys(work.photos).length ? "Finish" : "Skip") : "Skip this one"}</button>`;
       mountCameraEditor(panel.querySelector(".cam-edit"), work.plan, sh, planOpts, () => { saveDraft(); renderPhoto(); });
       panel.querySelector("#g-cam-reset")?.addEventListener("click", () => { delete work.plan.cams[sh.key]; saveDraft(); renderPhoto(); });
-      panel.querySelector("#g-back").addEventListener("click", () => { if (photoIndex > 0) photoIndex -= 1; else step = "areas"; render(); });
+      panel.querySelector("#g-back").addEventListener("click", () => { if (photoIndex > 0) photoIndex -= 1; else step = "order"; render(); });
       panel.querySelector("#g-close").addEventListener("click", closeForLater);
       panel.querySelector("#g-photo").addEventListener("click", async () => {
         const guide = await walkGuide(sh, shots, existing);
@@ -2231,7 +2261,7 @@ function runGuidedWalk({ garden = null } = {}) {
 
     const render = () => {
       panel.scrollTop = 0; window.scrollTo(0, 0);
-      ({ size: renderSize, shape: renderShape, areas: renderAreas, photo: renderPhoto })[step]();
+      ({ size: renderSize, shape: renderShape, areas: renderAreas, order: renderOrder, photo: renderPhoto })[step]();
       panel.querySelector("#g-close")?.addEventListener("click", closeForLater);
       if (work.plan) saveDraft();
     };
