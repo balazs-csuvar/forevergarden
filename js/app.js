@@ -1,5 +1,6 @@
 import { getValue, setValue, getBlob, putBlob, deleteBlobsWithPrefix, uid } from "./store.js";
 import { readablePhoto, decodePhoto } from "./photo-input.js";
+import { openCamera, cameraAvailable } from "./camera.js";
 import { searchPlants, SOURCE_LABEL } from "./plant-index.js";
 import { segmentAt, pointInPoly, polyBounds } from "./segment.js";
 import { buildFirstGarden, newSpot } from "./seed.js";
@@ -68,7 +69,16 @@ function closeSheet() {
 }
 
 /* ---------- photo helpers ---------- */
-function pickPhoto() {
+// Take a photo with the in-app camera (optionally with a guide to line it up), or choose one.
+async function pickPhoto(opts = {}) {
+  if (opts.camera !== false && cameraAvailable()) {
+    const r = await openCamera({ ...opts, title: esc(opts.title || ""), hint: esc(opts.hint || "") });
+    if (r?.blob) { if (opts.onGhost) opts.onGhost(r.ghostUsed); return r.blob; }
+    if (!r?.gallery) return null;
+  }
+  return pickFile();
+}
+function pickFile() {
   return new Promise((resolve) => {
     const input = $("#gallery-input");
     input.value = "";
@@ -1724,7 +1734,7 @@ function viewMoreSheet(spot) {
     if (a === "start") { state.startSpotId = spot.id; save(); closeSheet(); toast("Walks now start here"); }
     if (a === "photos") openViewPhotos(spot);
     if (a === "photo") {
-      const blob = await pickPhoto();
+      const blob = await pickPhoto({ title: spot.name, ghostUrl: await photoUrl(spot.photoId), ghostMode: "full", hint: "Line the picture up with last time's photo, then take it." });
       if (!blob) return;
       const taken = await photoTakenOn(blob);
       const older = spot.photoDate && taken < spot.photoDate;
@@ -1913,13 +1923,30 @@ function runGuidedWalk({ garden = null } = {}) {
   return new Promise((resolve) => {
     const panel = $("#guide");
     const plan = garden?.plan ? JSON.parse(JSON.stringify(garden.plan)) : null;
-    const work = { plan, photos: {}, dates: {}, views: { shape: {}, areas: {} } };
+    const work = { plan, photos: {}, dates: {}, ghosts: {}, views: { shape: {}, areas: {} } };
+    // What to show in the camera to line the photo up: the edge of the previous section of this
+    // border (on the side where they meet), or last time's photo of this view when retaking.
+    const GHOST_OVERLAP = 0.22;
+    const walkGuide = async (sh, shots, existing) => {
+      if (sh.count > 1 && sh.index > 0) {
+        const prev = shots.find((x) => x.area === sh.area && x.index === sh.index - 1);
+        const prevSpot = shotSpot(garden, prev);
+        const blob = work.photos[prev.key];
+        const url = blob ? URL.createObjectURL(blob) : prevSpot ? await photoUrl(prevSpot.photoId) : null;
+        if (url) {
+          const side = linkSpot(cameraFor(work.plan, prev), centroid(sh.poly)).x >= 0.5 ? "left" : "right";
+          return { ghostUrl: url, ghostMode: side, overlap: GHOST_OVERLAP, prevKey: prev.key, revoke: !!blob, hint: `Line up the faded strip on the ${side} with section ${sh.index}: same plants, same place.` };
+        }
+      }
+      if (existing?.photoId) return { ghostUrl: await photoUrl(existing.photoId), ghostMode: "full", hint: "Line the picture up with last time's photo, then take it." };
+      return { hint: "Fit the whole stretch in, phone upright at chest height." };
+    };
     // The walk saves as you go: plan, step and photos, so you can stop and carry on later.
     const DRAFT = "walkDraft", DRAFT_BLOBS = "walkdraft:";
     let draftTimer = null;
     const saveDraft = () => {
       clearTimeout(draftTimer);
-      draftTimer = setTimeout(() => setValue(DRAFT, { plan: work.plan, step, photoIndex, dates: work.dates, photoKeys: Object.keys(work.photos), forGarden: !!garden, savedAt: new Date().toISOString() }).catch(() => {}), 300);
+      draftTimer = setTimeout(() => setValue(DRAFT, { plan: work.plan, step, photoIndex, dates: work.dates, ghosts: work.ghosts, photoKeys: Object.keys(work.photos), forGarden: !!garden, savedAt: new Date().toISOString() }).catch(() => {}), 300);
     };
     const clearDraft = async () => { clearTimeout(draftTimer); await setValue(DRAFT, null).catch(() => {}); await deleteBlobsWithPrefix(DRAFT_BLOBS).catch(() => {}); };
     const bindZoom = (editor) => panel.querySelectorAll("[data-z]").forEach((btn) => btn.addEventListener("click", () => {
@@ -2109,8 +2136,13 @@ function runGuidedWalk({ garden = null } = {}) {
       panel.querySelector("#g-back").addEventListener("click", () => { if (photoIndex > 0) photoIndex -= 1; else step = "areas"; render(); });
       panel.querySelector("#g-close").addEventListener("click", closeForLater);
       panel.querySelector("#g-photo").addEventListener("click", async () => {
-        const blob = await pickPhoto();
+        const guide = await walkGuide(sh, shots, existing);
+        let ghostUsed = false;
+        const blob = await pickPhoto({ ...guide, title: `${sh.area.name}${sh.count > 1 ? ` ${sh.index + 1} of ${sh.count}` : ""}`, onGhost: (used) => { ghostUsed = used; } });
+        if (guide.revoke) URL.revokeObjectURL(guide.ghostUrl);
         if (!blob) return;
+        if (guide.prevKey && ghostUsed) work.ghosts[sh.key] = { prevKey: guide.prevKey, side: guide.ghostMode, overlap: guide.overlap };
+        else delete work.ghosts[sh.key];
         const btn = panel.querySelector("#g-photo");
         if (btn) { btn.disabled = true; btn.textContent = "Saving photo…"; }
         try {
@@ -2156,6 +2188,15 @@ function runGuidedWalk({ garden = null } = {}) {
             Object.assign(spot.areas[0], { name: sh.name, note: `About ${describeSize(sh.poly)} on your plan. Set its light and moisture so ideas fit.` });
             g.spots.push(spot);
           }
+        }
+        // Sections lined up with the camera guide overlap by a known amount: keep it as a hint for
+        // joining them into one strip (left|right spot ids -> where the right one starts).
+        for (const sh of shots) {
+          const gh = work.ghosts[sh.key];
+          const cur = shotSpot(g, sh), prev = gh && shotSpot(g, shots.find((x) => x.key === gh.prevKey));
+          if (!cur || !prev) continue;
+          g.alignHint ||= {};
+          g.alignHint[gh.side === "left" ? `${prev.id}|${cur.id}` : `${cur.id}|${prev.id}`] = 1 - gh.overlap;
         }
         // Path markers: to the next and previous section of the same border, and to the nearest
         // part of every other area, placed by where it lies from where you stood.
@@ -2212,6 +2253,7 @@ function runGuidedWalk({ garden = null } = {}) {
       panel.querySelector("#g-resume").addEventListener("click", async () => {
         work.plan = draft.plan;
         work.dates = draft.dates || {};
+        work.ghosts = draft.ghosts || {};
         for (const key of draft.photoKeys || []) {
           const blob = await getBlob(DRAFT_BLOBS + key).catch(() => null);
           if (blob) work.photos[key] = blob;
@@ -2306,7 +2348,7 @@ async function openViewPhotos(spot) {
       openViewPhotos(spot);
     }));
     body.querySelector("#vp-add").addEventListener("click", async () => {
-      const blob = await pickPhoto();
+      const blob = await pickPhoto({ title: spot.name, ghostUrl: await photoUrl(spot.photoId), ghostMode: "full", hint: "Line the picture up with last time's photo, then take it." });
       if (!blob) return;
       await replaceSpotPhoto(spot, blob);
       changed();
@@ -2347,8 +2389,12 @@ async function alignPair(a, b) {
   state.align ||= {};
   if (state.align[key]) return state.align[key];
   const r = overlapOffset(await spotPixels(a, pa.photoId), await spotPixels(b, pb.photoId));
-  // A weak match is more likely wrong than right: assume a modest overlap instead.
-  const res = r.score >= 0.3 ? r : { dx: 0.88, dy: 0, score: r.score, guessed: true };
+  // Photos lined up with the camera guide overlap by a known amount: trust that over a weak or
+  // distant match. Otherwise a weak match is more likely wrong than right: assume a modest overlap.
+  const hint = state.alignHint?.[`${a.id}|${b.id}`];
+  const res = hint != null && (r.score < 0.45 || Math.abs(r.dx - hint) > 0.12)
+    ? { dx: hint, dy: r.score >= 0.3 ? r.dy : 0, score: r.score, hinted: true }
+    : r.score >= 0.3 ? r : { dx: 0.88, dy: 0, score: r.score, guessed: true };
   state.align[key] = res;
   save();
   return res;
